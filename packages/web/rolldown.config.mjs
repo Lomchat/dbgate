@@ -117,6 +117,13 @@ export default defineConfig([
             src: '../../node_modules/diff2html/bundles/css/diff2html.min.css',
             dest: 'public/build/',
           },
+          {
+            // Ace charge ses workers dynamiquement depuis le dossier du bundle.
+            // Sans cette copie, la console affiche un NetworkError sur worker-json.js
+            // des qu'un editeur JSON est ouvert.
+            src: '../../node_modules/ace-builds/src-noconflict/worker-*.js',
+            dest: 'public/build/',
+          },
         ],
       }),
 

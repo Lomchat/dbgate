@@ -258,14 +258,17 @@
     }
   }
 
+  // Le reglage peut etre absent (null/undefined) tant que l'utilisateur n'y a pas touche.
+  // Sans ce garde-fou, Ace recevait 'ace/keyboard/null' et tentait de charger
+  // keybinding-null.js, qui n'existe pas.
+  function resolveKeyboardHandler(mode: string) {
+    return !mode || mode == 'default' ? null : 'ace/keyboard/' + mode;
+  }
+
   $: watchKeyBindingMode(keyBindingMode);
   function watchKeyBindingMode(newMode: string) {
     if (editor) {
-      if (newMode == 'default') {
-        editor.setKeyboardHandler(null);
-      } else {
-        editor.setKeyboardHandler('ace/keyboard/' + newMode);
-      }
+      editor.setKeyboardHandler(resolveKeyboardHandler(newMode));
     }
   }
 
@@ -493,7 +496,7 @@
 
     editor.container.addEventListener('contextmenu', handleContextMenu);
     editor.keyBinding.addKeyboardHandler(handleKeyDown);
-    editor.setKeyboardHandler(keyBindingMode == 'default' ? null : 'ace/keyboard/' + keyBindingMode);
+    editor.setKeyboardHandler(resolveKeyboardHandler(keyBindingMode));
     editor.renderer.setScrollMargin(2, 0);
     changedQueryParts();
 

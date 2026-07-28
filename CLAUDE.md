@@ -192,6 +192,23 @@ Conflits laissés à DbGate par défaut, car ce sont des actions applicatives l�
 seulement dans `commands/stdCommands.ts` : les onglets et la grille de données en enregistrent aussi
 (`tabs/`, `datagrid/`).
 
+### Erreurs console de l'éditeur Ace (corrigées)
+
+Deux erreurs présentes dans DbGate 7.1.6 d'origine, indépendantes de ce fork :
+
+**`worker-json.js` — NetworkError.** Ace charge ses workers dynamiquement depuis le dossier du
+bundle, mais `rolldown.config.mjs` ne les copiait pas. Corrigé en ajoutant
+`ace-builds/src-noconflict/worker-*.js` aux cibles du plugin `copy` (11 workers désormais livrés).
+
+**`keybinding-null.js` — 401.** `AceEditor.svelte` construisait `'ace/keyboard/' + keyBindingMode`
+dès que le mode n'était pas exactement `'default'`. Or le réglage vaut `null` tant que l'utilisateur
+n'y a pas touché, d'où une requête vers `keybinding-null.js`. Corrigé par `resolveKeyboardHandler()`,
+qui traite toute valeur absente comme `default`.
+
+> Le 401 plutôt qu'un 404 vient de l'authentification de l'API, qui répond 401 sur les chemins
+> statiques inconnus. Un 401 sur un fichier `/build/*` signifie donc « fichier absent », pas
+> « problème de droits ».
+
 ## Serveur de dev séparé (optionnel, rarement utile)
 
 La boucle `deploy.sh` prenant ~20 s, le serveur de dev n'apporte pas grand-chose ici. Il reste pertinent
