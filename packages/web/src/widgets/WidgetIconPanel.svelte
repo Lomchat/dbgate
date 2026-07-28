@@ -150,11 +150,40 @@
 
   $: promoWidgetData = $promoWidgetPreview || $promoWidget;
   $: config = useConfig();
+
+  // Infobulle du rail d'icones : le title natif est porte par la glyphe (~20pt) alors que la zone
+  // cliquable fait 50px de haut, donc il ne se declenche pas de facon fiable. Position fixed pour
+  // ne pas etre rognee par le rail.
+  let tooltipText = null;
+  let tooltipTop = 0;
+
+  const addLabel = _t('widgets.addNew', { defaultMessage: 'Add New' });
+  const settingsLabel = _t('command.settings', { defaultMessage: 'Settings' });
+
+  function showTooltip(event, text) {
+    if (!text) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    tooltipTop = rect.top + rect.height / 2;
+    tooltipText = text;
+  }
+
+  function hideTooltip() {
+    tooltipText = null;
+  }
 </script>
 
 <div class="main">
   {#if $visibleHamburgerMenuWidget}
-    <div class="wrapper mb-3" on:click={handleMainMenu} bind:this={domMainMenu} data-testid="WidgetIconPanel_menu">
+    {@const menuLabel = _t('widgets.mainMenu', { defaultMessage: 'Main menu' })}
+    <div
+      class="wrapper mb-3"
+      on:click={handleMainMenu}
+      bind:this={domMainMenu}
+      data-testid="WidgetIconPanel_menu"
+      aria-label={menuLabel}
+      on:mouseenter={e => showTooltip(e, menuLabel)}
+      on:mouseleave={hideTooltip}
+    >
       <FontIcon icon="icon menu" />
     </div>
   {/if}
@@ -168,8 +197,11 @@
       class:selected={item.name == $visibleSelectedWidget}
       data-testid={`WidgetIconPanel_${item.name}`}
       on:click={() => handleChangeWidget(item.name)}
+      aria-label={item.title}
+      on:mouseenter={e => showTooltip(e, item.title)}
+      on:mouseleave={hideTooltip}
     >
-      <FontIcon icon={item.icon} title={item.title} />
+      <FontIcon icon={item.icon} />
       {#if item.isPremiumPromo}
         <div class="premium-promo">Premium</div>
         {#if promoWidgetData?.identifier != $seenPremiumPromoWidget}
@@ -183,7 +215,9 @@
     class="wrapper"
     on:click={() => showModal(NewObjectModal)}
     data-testid="WidgetIconPanel_addButton"
-    title={_t('widgets.addNew', { defaultMessage: 'Add New' })}
+    aria-label={addLabel}
+    on:mouseenter={e => showTooltip(e, addLabel)}
+    on:mouseleave={hideTooltip}
   >
     <FontIcon icon="icon add" />
   </div>
@@ -203,25 +237,49 @@
 
   {#if getCurrentConfig().allowPrivateCloud}
     {#if $cloudSigninTokenHolder}
+      {@const cloudLabel = _t('widgets.cloudAccount', { defaultMessage: 'DbGate Cloud account' })}
       <div
         class="wrapper"
         on:click={handleCloudAccountMenu}
         bind:this={domCloudAccount}
         data-testid="WidgetIconPanel_cloudAccount"
+        aria-label={cloudLabel}
+        on:mouseenter={e => showTooltip(e, cloudLabel)}
+        on:mouseleave={hideTooltip}
       >
         <FontIcon icon="icon cloud-account-connected" />
       </div>
     {:else}
-      <div class="wrapper" on:click={handleOpenCloudLogin} data-testid="WidgetIconPanel_cloudAccount">
+      {@const cloudSigninLabel = _t('widgets.cloudSignIn', { defaultMessage: 'Sign in to DbGate Cloud' })}
+      <div
+        class="wrapper"
+        on:click={handleOpenCloudLogin}
+        data-testid="WidgetIconPanel_cloudAccount"
+        aria-label={cloudSigninLabel}
+        on:mouseenter={e => showTooltip(e, cloudSigninLabel)}
+        on:mouseleave={hideTooltip}
+      >
         <FontIcon icon="icon cloud-account" />
       </div>
     {/if}
   {/if}
 
-  <div class="wrapper" on:click={handleSettingsMenu} bind:this={domSettings} data-testid="WidgetIconPanel_settings">
+  <div
+    class="wrapper"
+    on:click={handleSettingsMenu}
+    bind:this={domSettings}
+    data-testid="WidgetIconPanel_settings"
+    aria-label={settingsLabel}
+    on:mouseenter={e => showTooltip(e, settingsLabel)}
+    on:mouseleave={hideTooltip}
+  >
     <FontIcon icon="icon settings" />
   </div>
 </div>
+
+{#if tooltipText}
+  <div class="sidebar-tooltip" style={`top: ${tooltipTop}px`}>{tooltipText}</div>
+{/if}
 
 <style>
   .wrapper {
@@ -247,6 +305,22 @@
     display: flex;
     flex: 1;
     flex-direction: column;
+  }
+
+  .sidebar-tooltip {
+    position: fixed;
+    left: calc(var(--dim-widget-icon-size) + 6px);
+    transform: translateY(-50%);
+    z-index: 1000;
+    pointer-events: none;
+    white-space: nowrap;
+    padding: 4px 9px;
+    border-radius: 4px;
+    font-size: 10pt;
+    background: var(--theme-modal-background);
+    color: var(--theme-generic-font);
+    border: 1px solid var(--theme-modal-border);
+    box-shadow: var(--theme-modal-shadow);
   }
 
   .premium-promo {

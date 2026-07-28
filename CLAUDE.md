@@ -154,7 +154,24 @@ git log --oneline v7.1.6..upstream/master
   (bloc, classe de layout `.tabs-upgrade-button`, CSS associé et import devenu orphelin)
 - `packages/web/src/settings/UpgradeSettings.svelte` — **nouveau** : écran d'upgrade déplacé dans les réglages
 - `packages/web/src/tabs/SettingsTab.svelte` — ajout de l'entrée « Upgrade to Premium » sous « Keyboard shortcuts »
+- `packages/web/src/widgets/WidgetIconPanel.svelte` — infobulles sur le rail d'icônes de gauche
+  (voir ci-dessous)
 - `deploy.sh` — **nouveau** : script de build et de déploiement
+
+### Infobulles du rail d'icônes
+
+Le `title` natif était posé par `FontIcon` sur le `<span>` de la glyphe (~20pt) alors que la zone
+cliquable fait 50px de haut : il ne se déclenchait donc pas de façon fiable. Trois boutons (menu,
+compte cloud, réglages) n'avaient même aucun libellé.
+
+Remplacé par une infobulle maison dans `WidgetIconPanel.svelte` : `on:mouseenter` sur le `.wrapper`
+complet, position `fixed` calée sur `--dim-widget-icon-size` pour ne pas être rognée par le rail,
+couleurs issues des variables `--theme-modal-*` (donc correctes en thème clair comme sombre).
+Le `title` natif a été retiré des `FontIcon` du rail pour éviter la double infobulle, et remplacé
+par un `aria-label` sur le wrapper.
+
+⚠️ En Svelte, `{@const}` n'est valide que comme enfant direct d'un bloc (`{#if}`, `{#each}`…).
+Les libellés des boutons hors bloc sont donc déclarés dans le `<script>`.
 
 ## Serveur de dev séparé (optionnel, rarement utile)
 
