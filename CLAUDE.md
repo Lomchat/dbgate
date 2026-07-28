@@ -2,6 +2,85 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+---
+
+# ⚠️ Fork local — à lire en premier
+
+Ce dépôt est un **fork de DbGate figé sur le tag `v7.1.6`**, utilisé pour personnaliser l'interface
+d'une instance DbGate qui tourne sur ce serveur. Tout ce qui suit est spécifique à cette installation
+et ne vient pas du projet amont.
+
+## Les emplacements à ne pas confondre
+
+| Chemin | Rôle |
+|---|---|
+| `/srv/dbgate-dev` | **Ce dépôt.** Les sources modifiables, c'est ici qu'on code. |
+| `/srv/dbgate` | L'instance qui tourne (paquet npm `dbgate-serve@7.1.6`), service systemd `dbgate.service`, port 9999 |
+| `/root/.dbgate` | **Les données** : connexions, mots de passe, historique, thèmes. Jamais dans le dépôt. |
+| `/srv/dbgate-dev-data` | Copie isolée des données, utilisée uniquement par le serveur de dev |
+
+Accès public : `https://<DOMAINE>` → Apache (`/etc/httpd/conf.d/<DOMAINE>.conf`) → `localhost:9999`.
+
+> Les valeurs réelles (domaine, IP, accès) sont dans `CLAUDE.local.md`, non versionné.
+
+## Déployer une modification
+
+```sh
+/srv/dbgate-dev/deploy.sh     # build prod + sauvegarde + bascule + restart  (~25 s)
+```
+
+Puis **Ctrl+Shift+R** dans le navigateur — sans rafraîchissement forcé, l'ancien `bundle.js` reste en cache
+et on croit à tort que la modification n'est pas passée.
+
+Le script refuse de déployer s'il détecte un build de dev (présence de `localhost:3000` dans le bundle)
+et sauvegarde l'existant dans `/srv/dbgate-web-public.bak.<horodatage>` avant chaque bascule.
+
+Rollback :
+```sh
+rsync -a --delete /srv/dbgate-web-public.bak.<horodatage>/ /srv/dbgate/node_modules/dbgate-web/public/
+systemctl restart dbgate.service
+```
+
+## ⚠️ Fragilité principale
+
+Le front déployé vit dans `/srv/dbgate/node_modules/dbgate-web/public/`. **Un `npm install` ou une montée
+de version de `dbgate-serve` l'écrasera sans prévenir** et les personnalisations disparaîtront.
+
+Ce n'est pas une perte : les sources sont ici, il suffit de relancer `deploy.sh`. Mais il ne faut pas
+s'étonner de voir l'interface revenir à son état d'origine après une mise à jour.
+
+## Contraintes à respecter
+
+- **Rester sur `v7.1.6`.** Le front déployé doit correspondre à la version de `dbgate-serve` installée.
+  Une montée de version du fork sans montée équivalente de l'instance casse le contrat d'API.
+- **Node 20 obligatoire** (`nvm use 20`). Le shell par défaut est en Node 16, qui ne sait pas builder ce projet.
+- **`packages/api/.env` contient `WORKSPACE_DIR=/srv/dbgate-dev-data`.** Ce garde-fou empêche le serveur de dev
+  d'écrire dans les vraies données. Ne jamais le faire pointer vers `/root/.dbgate`.
+- **`/root/.dbgate/.key`** chiffre les mots de passe des connexions. Le perdre les rend définitivement illisibles.
+  Sauvegarde : `tar czf backup.tar.gz /root/.dbgate /srv/dbgate/.env`
+- **Licence GPL-3.0.** Modifier et utiliser en interne n'impose rien. Publier ou redistribuer une version modifiée
+  oblige à en publier les sources sous GPL. Conserver `LICENSE` et les en-têtes de copyright.
+
+## Modifications appliquées par rapport à l'amont
+
+- `packages/web/src/tabpanel/TabsPanel.svelte` — suppression du bouton « Upgrade » en haut à droite
+  (bloc, classe de layout `.tabs-upgrade-button`, CSS associé et import devenu orphelin)
+- `packages/web/src/settings/UpgradeSettings.svelte` — **nouveau** : écran d'upgrade déplacé dans les réglages
+- `packages/web/src/tabs/SettingsTab.svelte` — ajout de l'entrée « Upgrade to Premium » sous « Keyboard shortcuts »
+- `deploy.sh` — **nouveau** : script de build et de déploiement
+
+## Serveur de dev séparé (optionnel)
+
+Pour itérer sans toucher à l'instance publique :
+```sh
+cd /srv/dbgate-dev && yarn start                  # API sur 3000, watch rolldown, données isolées
+ssh -L 3000:127.0.0.1:3000 <USER>@<IP-SERVEUR>    # depuis le poste client, port 3000 fermé au pare-feu
+```
+Attention : ce mode produit un bundle avec `API_URL=http://localhost:3000` codé en dur — **ne jamais le déployer**.
+C'est précisément ce que vérifie le garde-fou de `deploy.sh`.
+
+---
+
 ## Project Overview
 
 DbGate is a cross-platform (no)SQL database manager supporting MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, Redis, SQLite, and more. It runs as a web app (Docker/NPM), an Electron desktop app, or in a browser. The monorepo uses Yarn workspaces.

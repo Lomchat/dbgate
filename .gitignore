@@ -36,3 +36,27 @@ packages/web/public/*.html
 e2e-tests/screenshots/*.png
 my_guitar_shop.db
 .aider*
+
+# --- Fork local ---
+# Sauvegardes du front avant deploiement
+*.bak
+*.bak.*
+/backup/
+
+# Donnees DbGate : ne doivent JAMAIS entrer dans le depot
+# (connexions, mots de passe chiffres, cle de chiffrement, historique)
+.dbgate/
+dbgate-data/
+*.key
+connections.jsonl
+
+# Variantes locales du script de deploiement
+/deploy.local.sh
+
+# Notes locales : domaine, IP, acces reels (depot public)
+CLAUDE.local.md
+
+# Outils
+.claude/
+.idea/
+*.swp
