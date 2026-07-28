@@ -3,9 +3,50 @@
   import { get } from 'svelte/store';
   import { runGroupCommand } from './runCommand';
   import { getKeyTextFromEvent, isMac, resolveKeyText } from '../utility/common';
+  import getElectron from '../utility/getElectron';
+
+  // Raccourcis laisses au navigateur quand DbGate tourne dans un onglet.
+  //
+  // Sans cette liste, DbGate fait preventDefault() sur ses propres raccourcis et confisque
+  // le rechargement, les devtools, la barre d'adresse et le zoom : l'onglet devient
+  // difficilement utilisable. En Electron il n'y a pas de navigateur autour, donc la liste
+  // ne s'applique pas et toutes les commandes DbGate restent disponibles.
+  //
+  // Pour rendre un raccourci a DbGate, retirer la ligne correspondante.
+  const BROWSER_RESERVED_KEYS = [
+    // Rechargement et outils de developpement
+    'ctrl+shift+r',
+    'ctrl+shift+i',
+    'ctrl+shift+j',
+    'ctrl+shift+c',
+    'f12',
+    // Navigation et onglets
+    'ctrl+l',
+    'ctrl+t',
+    'ctrl+shift+t',
+    'ctrl+n',
+    'ctrl+w',
+    // Zoom
+    'ctrl+0',
+    'ctrl+-',
+    'ctrl+=',
+    'ctrl++',
+    // Plein ecran
+    'f11',
+  ];
+
+  function isBrowserReservedKey(keyText: string) {
+    // getKeyTextFromEvent produit 'Ctrl+' ou 'Command+' selon la plateforme
+    const normalized = keyText.toLowerCase().replace('command+', 'ctrl+');
+    return BROWSER_RESERVED_KEYS.includes(normalized);
+  }
 
   export function handleCommandKeyDown(e) {
     const keyText = getKeyTextFromEvent(e);
+
+    if (!getElectron() && isBrowserReservedKey(keyText)) {
+      return;
+    }
 
     // console.log('keyText', keyText);
 

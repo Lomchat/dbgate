@@ -173,6 +173,25 @@ par un `aria-label` sur le wrapper.
 ⚠️ En Svelte, `{@const}` n'est valide que comme enfant direct d'un bloc (`{#if}`, `{#each}`…).
 Les libellés des boutons hors bloc sont donc déclarés dans le `<script>`.
 
+### Raccourcis clavier rendus au navigateur
+
+`commands/CommandListener.svelte` écoute `window.keydown` et appelle `preventDefault()` dès qu'un
+raccourci DbGate correspond. En version web, cela confisquait au navigateur **les trois moyens de
+recharger** (`F5`, `Ctrl+R`, `Ctrl+Shift+R`), les devtools (`Ctrl+Shift+C`), la barre d'adresse
+(`Ctrl+L`), les onglets (`Ctrl+T`, `Ctrl+Shift+T`) et le zoom (`Ctrl+0/-/=`).
+
+Une liste `BROWSER_RESERVED_KEYS` en tête du fichier rend ces touches au navigateur, **uniquement
+hors Electron** (dans l'application de bureau il n'y a pas de navigateur autour, toutes les commandes
+DbGate restent actives). Pour rendre un raccourci à DbGate, retirer sa ligne de la liste.
+
+Conflits laissés à DbGate par défaut, car ce sont des actions applicatives légitimes :
+`F5`/`Ctrl+R` (exécuter la requête), `Ctrl+F5` (rafraîchir avec la structure), `Ctrl+F`, `Ctrl+S`,
+`Ctrl+D`, `Ctrl+J`, `Ctrl+U`.
+
+⚠️ Pour diagnostiquer un raccourci, chercher `keyText` dans **tout** `packages/web/src`, pas
+seulement dans `commands/stdCommands.ts` : les onglets et la grille de données en enregistrent aussi
+(`tabs/`, `datagrid/`).
+
 ## Serveur de dev séparé (optionnel, rarement utile)
 
 La boucle `deploy.sh` prenant ~20 s, le serveur de dev n'apporte pas grand-chose ici. Il reste pertinent
