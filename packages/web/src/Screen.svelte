@@ -111,6 +111,11 @@
     bottom: var(--dim-statusbar-height);
     width: var(--dim-widget-icon-size);
     background: var(--theme-widget-panel-background);
+    /* position:fixed cree un contexte d'empilement : sans z-index explicite, tout le
+       sous-arbre du rail est peint avant .leftpanel (meme z-index auto, ordre DOM).
+       Les infobulles de WidgetIconPanel, qui debordent sur le panneau, passaient dessous.
+       Valeur volontairement basse : les modales et le snackbar (1000) restent au-dessus. */
+    z-index: 10;
   }
   .statusbar {
     position: fixed;

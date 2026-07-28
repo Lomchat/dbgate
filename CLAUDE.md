@@ -173,6 +173,31 @@ par un `aria-label` sur le wrapper.
 ⚠️ En Svelte, `{@const}` n'est valide que comme enfant direct d'un bloc (`{#if}`, `{#each}`…).
 Les libellés des boutons hors bloc sont donc déclarés dans le `<script>`.
 
+⚠️ **Piège d'empilement, résolu dans `Screen.svelte`.** `position: fixed` **crée un contexte
+d'empilement**. `.iconbar` étant en `position: fixed` sans `z-index`, le `z-index: 1000` de
+l'infobulle restait confiné au rail, et tout le rail était peint avant `.leftpanel` (même `z-index:
+auto`, départage par l'ordre DOM). Résultat : infobulle présente dans le DOM, `visibility: visible`,
+`opacity: 1`, et pourtant **invisible**. Corrigé par `z-index: 10` sur `.iconbar`.
+
+Toute infobulle ou menu qui doit déborder d'un panneau `position: fixed` rencontrera le même
+problème. Vérifier le rendu, pas seulement le DOM.
+
+### Vérifier le rendu sans passer par son navigateur
+
+```sh
+nvm use 20 && node tools/check-ui.js [data-testid]     # defaut : WidgetIconPanel_database
+```
+
+Charge l'instance locale, se connecte, survole le bouton et rapporte si l'infobulle est réellement
+**peinte au premier plan** — pas seulement présente. Capture écrite dans `/tmp/dbgate-check-ui.png`.
+
+C'est cet outil qui a tranché le bug d'empilement ci-dessus, après plusieurs allers-retours où le DOM
+paraissait correct. Les styles calculés ne suffisent pas : il faut le rendu.
+
+> Détail à connaître : l'infobulle porte `pointer-events: none`, donc `elementFromPoint()` la
+> traverse et signale un faux recouvrement. Le script neutralise temporairement cette propriété
+> pendant le test.
+
 ### Raccourcis clavier rendus au navigateur
 
 `commands/CommandListener.svelte` écoute `window.keydown` et appelle `preventDefault()` dès qu'un
