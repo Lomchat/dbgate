@@ -38,6 +38,9 @@ my_guitar_shop.db
 .aider*
 
 # --- Fork local ---
+# Runtime npm (dbgate-serve) : l'instance qui tourne, installee ici
+/runtime/
+
 # Sauvegardes du front avant deploiement
 *.bak
 *.bak.*

@@ -12,12 +12,27 @@ et ne vient pas du projet amont.
 
 ## Les emplacements à ne pas confondre
 
-| Chemin | Rôle |
-|---|---|
-| `/srv/dbgate-dev` | **Ce dépôt.** Les sources modifiables, c'est ici qu'on code. |
-| `/srv/dbgate` | L'instance qui tourne (paquet npm `dbgate-serve@7.1.6`), service systemd `dbgate.service`, port 9999 |
-| `/root/.dbgate` | **Les données** : connexions, mots de passe, historique, thèmes. Jamais dans le dépôt. |
-| `/srv/dbgate-dev-data` | Copie isolée des données, utilisée uniquement par le serveur de dev |
+Il n'existe que **deux** emplacements DbGate sur ce serveur : ce dépôt, et les données.
+
+| Chemin | Rôle | Versionné ? |
+|---|---|---|
+| `/srv/dbgate-dev` | **Ce dépôt.** Les sources modifiables, c'est ici qu'on code. | oui |
+| `/srv/dbgate-dev/runtime/` | **L'instance qui tourne** : paquet npm `dbgate-serve@7.1.6`. Lancée par le service systemd `dbgate.service` sur le port 9999. | non (gitignore) |
+| `/srv/dbgate-dev/backup/` | Sauvegardes horodatées du front, déposées par `deploy.sh` | non (gitignore) |
+| `/root/.dbgate` | **Les données** : connexions, mots de passe, historique, thèmes. Jamais dans le dépôt. | non |
+
+Le service pointe directement dans ce dépôt :
+```ini
+WorkingDirectory=/srv/dbgate-dev/runtime
+EnvironmentFile=/srv/dbgate-dev/runtime/.env     # PORT=9999, LOGIN_PASSWORD_admin
+ExecStart=<node20> /srv/dbgate-dev/runtime/node_modules/dbgate-serve/bin/dbgate-serve.js
+```
+
+> Pourquoi un runtime npm plutôt qu'un lancement direct depuis les sources ? Parce que l'API résout le
+> front via `path.join(__dirname, '../../dbgate-web/public')` et les plugins via le dossier parent du
+> paquet `dbgate-api` — deux chemins relatifs à la structure **npm**, pas à celle du monorepo. Les
+> reproduire à coups de liens symboliques marcherait, mais casserait de façon obscure à la première
+> mise à jour. Le runtime npm reste la voie testée par l'amont.
 
 Accès public : `https://<DOMAINE>` → Apache (`/etc/httpd/conf.d/<DOMAINE>.conf`) → `localhost:9999`.
 
@@ -33,21 +48,46 @@ Puis **Ctrl+Shift+R** dans le navigateur — sans rafraîchissement forcé, l'an
 et on croit à tort que la modification n'est pas passée.
 
 Le script refuse de déployer s'il détecte un build de dev (présence de `localhost:3000` dans le bundle)
-et sauvegarde l'existant dans `/srv/dbgate-web-public.bak.<horodatage>` avant chaque bascule.
+et sauvegarde l'existant dans `backup/public.<horodatage>` avant chaque bascule.
 
 Rollback :
 ```sh
-rsync -a --delete /srv/dbgate-web-public.bak.<horodatage>/ /srv/dbgate/node_modules/dbgate-web/public/
+rsync -a --delete /srv/dbgate-dev/backup/public.<horodatage>/ \
+                  /srv/dbgate-dev/runtime/node_modules/dbgate-web/public/
 systemctl restart dbgate.service
 ```
 
+`backup/public-origine-npm` contient le front npm d'origine, jamais modifié : c'est le filet de secours
+ultime pour revenir à une interface DbGate vierge.
+
 ## ⚠️ Fragilité principale
 
-Le front déployé vit dans `/srv/dbgate/node_modules/dbgate-web/public/`. **Un `npm install` ou une montée
-de version de `dbgate-serve` l'écrasera sans prévenir** et les personnalisations disparaîtront.
+Le front déployé vit dans `runtime/node_modules/dbgate-web/public/`. **Un `npm install` lancé dans
+`runtime/`, ou une montée de version de `dbgate-serve`, l'écrasera sans prévenir** et les
+personnalisations disparaîtront.
 
 Ce n'est pas une perte : les sources sont ici, il suffit de relancer `deploy.sh`. Mais il ne faut pas
 s'étonner de voir l'interface revenir à son état d'origine après une mise à jour.
+
+## ⚠️ Ne jamais utiliser le bouton « Sync fork » de GitHub sur `custom-ui`
+
+Le modèle de branches est le suivant :
+
+| Branche | Rôle |
+|---|---|
+| `master` | Miroir intact de l'amont. On n'y travaille jamais. |
+| `custom-ui` | **Tout le travail local**, basé sur le commit du tag `v7.1.6`. |
+
+Le bouton « Sync fork » de GitHub, appliqué à `custom-ui`, y **fusionne le master amont** : la branche
+saute alors de `7.1.6` à la dernière version de développement (une beta), et ne correspond plus au
+`dbgate-serve` installé dans `runtime/`. C'est déjà arrivé une fois — la sauvegarde de cet état est
+conservée sous l'étiquette `backup/sync-merge-20260728`.
+
+Pour regarder ce qui a changé en amont sans rien casser :
+```sh
+git fetch upstream
+git log --oneline v7.1.6..upstream/master
+```
 
 ## Contraintes à respecter
 
@@ -55,9 +95,10 @@ s'étonner de voir l'interface revenir à son état d'origine après une mise à
   Une montée de version du fork sans montée équivalente de l'instance casse le contrat d'API.
 - **Node 20 obligatoire** (`nvm use 20`). Le shell par défaut est en Node 16, qui ne sait pas builder ce projet.
 - **`packages/api/.env` contient `WORKSPACE_DIR=/srv/dbgate-dev-data`.** Ce garde-fou empêche le serveur de dev
-  d'écrire dans les vraies données. Ne jamais le faire pointer vers `/root/.dbgate`.
+  (`yarn start`) d'écrire dans les vraies données. Le dossier est recréé vide au besoin. Ne jamais le
+  faire pointer vers `/root/.dbgate`.
 - **`/root/.dbgate/.key`** chiffre les mots de passe des connexions. Le perdre les rend définitivement illisibles.
-  Sauvegarde : `tar czf backup.tar.gz /root/.dbgate /srv/dbgate/.env`
+  Sauvegarde : `tar czf backup.tar.gz /root/.dbgate /srv/dbgate-dev/runtime/.env`
 - **Licence GPL-3.0.** Modifier et utiliser en interne n'impose rien. Publier ou redistribuer une version modifiée
   oblige à en publier les sources sous GPL. Conserver `LICENSE` et les en-têtes de copyright.
 
