@@ -38,14 +38,60 @@ Accès public : `https://<DOMAINE>` → Apache (`/etc/httpd/conf.d/<DOMAINE>.con
 
 > Les valeurs réelles (domaine, IP, accès) sont dans `CLAUDE.local.md`, non versionné.
 
-## Déployer une modification
+## La boucle de travail
 
 ```sh
-/srv/dbgate-dev/deploy.sh     # build prod + sauvegarde + bascule + restart  (~25 s)
+# 1. Editer les sources du front
+vim /srv/dbgate-dev/packages/web/src/<composant>.svelte
+
+# 2. Deployer  (~20 s de build + ~2 s de redemarrage)
+/srv/dbgate-dev/deploy.sh
+
+# 3. Ctrl+Shift+R dans le navigateur
 ```
 
-Puis **Ctrl+Shift+R** dans le navigateur — sans rafraîchissement forcé, l'ancien `bundle.js` reste en cache
-et on croit à tort que la modification n'est pas passée.
+Trois pièges dans cette boucle, tous rencontrés en vrai :
+
+**Le cache navigateur.** Sans **Ctrl+Shift+R**, l'ancien `bundle.js` reste servi et on conclut à tort
+que la modification n'est pas passée. C'est de loin la fausse alerte la plus fréquente.
+
+**Le 503 juste après le déploiement.** DbGate met ~2 secondes à écouter après un `systemctl restart`.
+Pendant ce laps de temps Apache répond `503`. Ce n'est pas une panne : il faut simplement attendre.
+
+**`deploy.sh` ne construit que le front** (`yarn build:web`). Une modification dans `packages/api/`
+n'est pas prise en compte : le back exécuté est celui de `runtime/node_modules/dbgate-api/`, un paquet
+npm. Personnaliser le back demanderait une autre approche que ce script.
+
+### Où se trouve quoi dans le front
+
+Tout est sous `packages/web/src/` :
+
+| Chemin | Contenu |
+|---|---|
+| `widgets/WidgetIconPanel.svelte` | La bande d'icônes verticale à gauche |
+| `widgets/WidgetColumnBar.svelte` | Les sections repliables de la sidebar |
+| `widgets/DatabaseWidget.svelte`, `ConnectionList.svelte` | Arbre des bases, liste des connexions |
+| `widgets/SqlObjectList.svelte` | Tables, vues, procédures |
+| `tabpanel/TabsPanel.svelte` | La barre d'onglets et ses boutons en haut à droite |
+| `tabs/SettingsTab.svelte` | Le menu des réglages (y enregistrer tout nouvel écran) |
+| `settings/*.svelte` | Un fichier par écran de réglages |
+| `Screen.svelte` | Le layout global, largeurs des panneaux |
+
+Les fichiers `packages/web/public/*.css` (`global.css`, `tokens.css`, `dimensions.css`, `tailwind-colors.css`)
+sont versionnés, en clair et non minifiés. Les modifier ne demande **aucune compilation** — mais il faut
+quand même `deploy.sh` pour les recopier vers `runtime/`. Pour un essai jetable, on peut les éditer
+directement dans `runtime/node_modules/dbgate-web/public/` : effet immédiat au rafraîchissement, mais
+hors du dépôt, donc à reporter dans les sources si on veut le garder.
+
+### Vérifier qu'un déploiement a bien atterri
+
+Plutôt que de se fier à l'œil, on interroge le bundle réellement servi :
+
+```sh
+curl -s https://<DOMAINE>/build/bundle.js | grep -c "<un-identifiant-de-ta-modif>"
+```
+
+Les attributs `data-testid` du code sont parfaits pour ça — ils survivent à la minification.
 
 Le script refuse de déployer s'il détecte un build de dev (présence de `localhost:3000` dans le bundle)
 et sauvegarde l'existant dans `backup/public.<horodatage>` avant chaque bascule.
@@ -110,9 +156,10 @@ git log --oneline v7.1.6..upstream/master
 - `packages/web/src/tabs/SettingsTab.svelte` — ajout de l'entrée « Upgrade to Premium » sous « Keyboard shortcuts »
 - `deploy.sh` — **nouveau** : script de build et de déploiement
 
-## Serveur de dev séparé (optionnel)
+## Serveur de dev séparé (optionnel, rarement utile)
 
-Pour itérer sans toucher à l'instance publique :
+La boucle `deploy.sh` prenant ~20 s, le serveur de dev n'apporte pas grand-chose ici. Il reste pertinent
+pour expérimenter sans jamais toucher à l'instance publique :
 ```sh
 cd /srv/dbgate-dev && yarn start                  # API sur 3000, watch rolldown, données isolées
 ssh -L 3000:127.0.0.1:3000 <USER>@<IP-SERVEUR>    # depuis le poste client, port 3000 fermé au pare-feu
