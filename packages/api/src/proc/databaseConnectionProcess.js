@@ -611,12 +611,18 @@ async function handleMessage({ msgtype, ...other }) {
   await handler(other);
 }
 
+// Delai d'inactivite avant que le processus de connexion ne se ferme.
+// L'amont fixe 40 s : chaque retour sur une base apres une pause paie alors un demarrage a
+// froid complet (fork Node, chargement de dbgate-api et du plugin, reconnexion au SGBD).
+// Reglable par CONNECTION_IDLE_SECONDS dans runtime/.env, sans retoucher au code.
+const IDLE_TIMEOUT_MS = (parseInt(process.env.CONNECTION_IDLE_SECONDS, 10) || 600) * 1000;
+
 function start() {
   childProcessChecker();
 
   setInterval(async () => {
     const time = new Date().getTime();
-    if (time - lastPing > 40 * 1000) {
+    if (time - lastPing > IDLE_TIMEOUT_MS) {
       logger.info(getLogInfo(), 'DBGM-00040 Database connection not alive, exiting');
       const driver = requireEngineDriver(storedConnection);
       await driver.close(dbhan);

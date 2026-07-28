@@ -190,12 +190,15 @@ async function handleMessage({ msgtype, ...other }) {
   await handler(other);
 }
 
+// Voir databaseConnectionProcess.js : meme delai, meme raison.
+const IDLE_TIMEOUT_MS = (parseInt(process.env.CONNECTION_IDLE_SECONDS, 10) || 600) * 1000;
+
 function start() {
   childProcessChecker();
 
   setInterval(async () => {
     const time = new Date().getTime();
-    if (time - lastPing > 40 * 1000) {
+    if (time - lastPing > IDLE_TIMEOUT_MS) {
       logger.info('DBGM-00044 Server connection not alive, exiting');
       const driver = requireEngineDriver(storedConnection);
       if (dbhan) {

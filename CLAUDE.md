@@ -241,6 +241,50 @@ avec un `storageName` distinct pour que les hauteurs des deux dispositions ne se
 > Le bouton est posé sur **toutes** les sections de contenu, pas seulement « Tables, vues, fonctions ».
 > Sans base sélectionnée, seule la section d'attente s'affiche : sans cela, impossible de revenir en arrière.
 
+### ⚠️ Lenteur d'ouverture des bases — la vraie cause
+
+Symptôme : plusieurs secondes avant de voir les tables, **quel que soit le moteur**. Décomposition
+mesurée en pilotant un navigateur :
+
+| Appel | Coût |
+|---|---|
+| `/database-connections/structure` (tables, vues, fonctions) | **~30 ms** — jamais en cause |
+| `/database-connections/schema-list` à froid | **16 122 ms** |
+| le même, une fois la cause corrigée | **611 ms** |
+
+Trois faits qui s'emboîtent :
+
+1. **DbGate tue ses processus de connexion après 40 s d'inactivité** (`databaseConnectionProcess.js`,
+   `serverConnectionProcess.js`). Chaque retour sur une base paie un démarrage à froid : fork Node,
+   chargement de `dbgate-api` et du plugin, reconnexion au SGBD.
+2. **Ce démarrage à froid contacte `api.dbgate.io`.** Depuis ce serveur, l'hôte **accepte la connexion
+   TCP en ~1 s puis ne répond jamais** — pas d'échec franc, juste une attente.
+3. **`cloudIntf.js` ne pose aucun timeout** sur ses appels axios. L'attente va donc jusqu'au délai TCP
+   du système, ~15 s, à **chaque ouverture de base**.
+
+**Correctifs en place :**
+
+- `0.0.0.0 api.dbgate.io` dans **`/etc/hosts`** — l'appel échoue instantanément. ⚠️ C'est un remède
+  **système, hors du dépôt** : invisible pour qui ne lit que ce fichier. Il coupe DbGate Cloud, qui
+  ne fonctionnait déjà plus puisque l'hôte ne répond pas. Pour annuler : retirer la ligne.
+- Délai d'inactivité porté de 40 s à **600 s**, réglable par `CONNECTION_IDLE_SECONDS` dans
+  `runtime/.env`. Déployé par `deploy-api.sh`.
+
+> Piège de diagnostic : cette attente de ~15 s contaminait toutes les autres mesures. Les valeurs
+> à 15 000 et 30 000 ms rencontrées pendant l'enquête sur Mongo en venaient en partie. Devant un
+> chiffre suspicieusement rond, chercher une expiration réseau avant d'optimiser du code.
+
+### Déployer un correctif dans `packages/api/`
+
+```sh
+/srv/dbgate/deploy-api.sh
+```
+
+`dbgate-api` est publié **avec ses sources en clair**, pas en bundle : on peut donc les corriger
+directement dans le runtime. Le script recopie la liste de fichiers déclarée en tête, conserve
+l'original une seule fois dans `backup/api/` et redémarre. Ajouter tout nouveau fichier corrigé à
+la liste `FILES`.
+
 ### Lenteur de chargement des collections Mongo
 
 L'arbre mettait 15 à 31 secondes à apparaître sur certaines bases Mongo. Décomposition mesurée :
