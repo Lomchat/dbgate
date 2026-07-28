@@ -60,7 +60,18 @@ Pendant ce laps de temps Apache répond `503`. Ce n'est pas une panne : il faut 
 
 **`deploy.sh` ne construit que le front** (`yarn build:web`). Une modification dans `packages/api/`
 n'est pas prise en compte : le back exécuté est celui de `runtime/node_modules/dbgate-api/`, un paquet
-npm. Personnaliser le back demanderait une autre approche que ce script.
+npm. Pour les **plugins**, utiliser :
+
+```sh
+/srv/dbgate/deploy-plugin.sh dbgate-plugin-mongo
+```
+
+qui construit le backend du plugin, sauvegarde l'original une fois pour toutes dans
+`backup/plugins/`, bascule et redémarre. `packages/api/` lui-même reste non déployable par script.
+
+⚠️ Ce script utilise `command cp -f`. Sur ce serveur `cp` est aliasé en mode interactif : un `cp`
+nu demande une confirmation qu'un script ne peut pas donner, **sort avec succès et laisse
+silencieusement l'ancien fichier en place**. Le script vérifie donc l'empreinte après copie.
 
 ### Où se trouve quoi dans le front
 
@@ -229,6 +240,40 @@ avec un `storageName` distinct pour que les hauteurs des deux dispositions ne se
 
 > Le bouton est posé sur **toutes** les sections de contenu, pas seulement « Tables, vues, fonctions ».
 > Sans base sélectionnée, seule la section d'attente s'affiche : sans cela, impossible de revenir en arrière.
+
+### Lenteur de chargement des collections Mongo
+
+L'arbre mettait 15 à 31 secondes à apparaître sur certaines bases Mongo. Décomposition mesurée :
+
+| Étape | Coût |
+|---|---|
+| `listCollections()` — la liste elle-même | **~15 ms**, constant |
+| `$collStats` par collection, en séquentiel | ~26–37 ms |
+| Les mêmes en parallèle sans limite (code d'origine) | **15 000 à 31 000 ms** |
+
+`Analyser.js` lançait un `$collStats` par collection, toutes via un `Promise.all` unique. Sur un
+serveur distant cela sature le pool de connexions et les requêtes expirent au lieu d'aller plus vite.
+Or ces statistiques (nombre de documents, taille) ne servent qu'à **décorer** l'arbre.
+
+Corrigé par : parallélisme borné (`STATS_CONCURRENCY = 4`) et budget de temps
+(`STATS_BUDGET_MS = 1200`). Résultat : 15 238 ms → 1 218 ms, 15 339 ms → 112 ms.
+
+⚠️ **Un budget vérifié en tête de boucle ne borne rien.** Une requête déjà partie n'est jamais
+interrompue, et `maxTimeMS` ne limite que l'exécution serveur — ni l'attente réseau, ni l'acquisition
+d'une connexion. Première version : budget de 2 500 ms, temps réel mesuré à 30 047 ms, soit **pire**
+que l'original. Il a fallu un `Promise.race` explicite contre un minuteur pour que le budget existe
+vraiment. Les compteurs en retard sont simplement absents de l'affichage.
+
+⚠️ Les statistiques étaient indexées **par position** (`stats[index]`) alors que les requêtes
+peuvent échouer indépendamment : un seul échec décalait tous les compteurs suivants sur les mauvaises
+collections. Désormais indexées par nom.
+
+> Piste non explorée : DbGate ne met aucun modèle en cache et refait une analyse complète à chaque
+> besoin — 251 analyses complètes relevées dans les logs pour une seule base de 28 tables. Le driver
+> Mongo n'implémente pas non plus `getModifications()`, donc jamais d'analyse incrémentale. Attention
+> si on s'y attaque : renvoyer des `setTableRowCounts` sans détecter aussi les ajouts et suppressions
+> ferait que **les nouvelles collections n'apparaîtraient plus jamais**. Et les collections Mongo
+> n'ont pas d'`objectId`, qui est pourtant la clé de fusion des compteurs.
 
 ### Raccourcis clavier rendus au navigateur
 
