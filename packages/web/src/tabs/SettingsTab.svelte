@@ -13,6 +13,7 @@
   import BehaviourSettings from '../settings/BehaviourSettings.svelte';
   import ExternalToolsSettings from '../settings/ExternalToolsSettings.svelte';
   import LicenseSettings from '../settings/LicenseSettings.svelte';
+  import UpgradeSettings from '../settings/UpgradeSettings.svelte';
   import { isProApp } from '../utility/proTools';
   import { _t } from '../translations';
   import CommandListTab from './CommandListTab.svelte';
@@ -103,6 +104,13 @@
       component: CommandListTab,
       props: {},
       testid: 'settings-shortcuts',
+    },
+    !isProApp() && {
+      label: _t('settings.upgrade', { defaultMessage: 'Upgrade to Premium' }),
+      identifier: 'upgrade',
+      component: UpgradeSettings,
+      props: {},
+      testid: 'settings-upgrade',
     },
     hasPermission('settings/change') &&
       isProApp() && {
