@@ -10,6 +10,7 @@ const {
   extractShellApiPlugins,
   compileShellApiFunctionName,
   jsonScriptToJavascript,
+  assertValidShellApiFunctionName,
   getLogger,
   safeJsonParse,
   pinoLogRecordToMessageRecord,
@@ -54,19 +55,23 @@ logger.info('DBGM-00014 Finished job script');
 dbgateApi.runScript(run);
 `;
 
-const loaderScriptTemplate = (prefix, functionName, props, runid) => `
+const loaderScriptTemplate = (functionName, props, runid) => {
+  const plugins = extractShellApiPlugins(functionName, props);
+  const prefix = plugins.map(packageName => `// @require ${packageName}\n`).join('');
+  return `
 ${prefix}
 const dbgateApi = require(process.env.DBGATE_API);
 dbgateApi.initializeApiEnvironment();
-${requirePluginsTemplate(extractShellApiPlugins(functionName, props))}
+${requirePluginsTemplate(plugins)}
 require=null;
 async function run() {
 const reader=await ${compileShellApiFunctionName(functionName)}(${JSON.stringify(props)});
-const writer=await dbgateApi.collectorWriter({runid: '${runid}'});
+const writer=await dbgateApi.collectorWriter({runid: ${JSON.stringify(runid)}});
 await dbgateApi.copyStream(reader, writer);
 }
 dbgateApi.runScript(run);
 `;
+};
 
 module.exports = {
   /** @type {import('dbgate-types').OpenedRunner[]} */
@@ -196,6 +201,27 @@ module.exports = {
       // @ts-ignore
       const { msgtype } = message;
       if (handleProcessCommunication(message, subprocess)) return;
+      if (msgtype === 'get-volatile-connection') {
+        const connections = require('./connections');
+        // @ts-ignore
+        const conid = message.conid;
+        if (!conid || typeof conid !== 'string') return;
+        const trySend = payload => {
+          if (!subprocess.connected) return;
+          try {
+            subprocess.send(payload);
+          } catch {
+            // child disconnected between the check and the send — ignore
+          }
+        };
+        connections.getCore({ conid }).then(conn => {
+          trySend({ msgtype: 'volatile-connection-response', conid, conn: conn?.unsaved ? conn : null });
+        }).catch(err => {
+          logger.error({ ...extractErrorLogData(err), conid }, 'DBGM-00000 Error resolving volatile connection for child process');
+          trySend({ msgtype: 'volatile-connection-response', conid, conn: null });
+        });
+        return;
+      }
       this[`handle_${msgtype}`](runid, message);
     });
     return _.pick(newOpened, ['runid']);
@@ -356,14 +382,12 @@ module.exports = {
         return { errorMessage: 'DBGM-00289 Unallowed file' };
       }
     }
-    const prefix = extractShellApiPlugins(functionName)
-      .map(packageName => `// @require ${packageName}\n`)
-      .join('');
 
     const promise = new Promise((resolve, reject) => {
+      assertValidShellApiFunctionName(functionName);
       const runid = crypto.randomUUID();
       this.requests[runid] = { resolve, reject, exitOnStreamError: true };
-      this.startCore(runid, loaderScriptTemplate(prefix, functionName, props, runid));
+      this.startCore(runid, loaderScriptTemplate(functionName, props, runid));
     });
     return promise;
   },

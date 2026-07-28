@@ -1,5 +1,5 @@
 import stream from 'stream';
-import { QueryResult } from './query';
+import { QueryResult, QueryResultColumn } from './query';
 import { SqlDialect } from './dialect';
 import { SqlDumper } from './dumper';
 import {
@@ -175,6 +175,7 @@ export interface DataEditorTypesBehaviour {
   parseDateAsDollar?: boolean;
   parseGeopointAsDollar?: boolean;
   parseFsDocumentRefAsDollar?: boolean;
+  parseUuid?: boolean;
 
   explicitDataType?: boolean;
   supportNumberType?: boolean;
@@ -260,6 +261,13 @@ export interface EngineDriver<TClient = any, TDataBase = any> extends FilterBeha
   implicitTransactions?: boolean; // transaction is started with first SQL command, no BEGIN TRANSACTION is needed
   premiumOnly?: boolean;
   supportExecuteQuery?: boolean;
+  supportsEditableQueryResults?: boolean;
+  enrichColumnMetadata?(
+    dbhan: DatabaseHandle<TClient, TDataBase>,
+    sql: string,
+    columns: QueryResultColumn[],
+    dbinfo?: DatabaseInfo
+  ): Promise<QueryResultColumn[]>;
 
   collectionSingularLabel?: string;
   collectionPluralLabel?: string;

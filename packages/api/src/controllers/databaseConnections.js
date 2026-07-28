@@ -15,6 +15,7 @@ const {
   getLogger,
   extractErrorLogData,
   filterStructureBySchema,
+  isCompositeDbName,
   serializeJsTypesForJsonStringify,
 } = require('dbgate-tools');
 const { html, parse } = require('diff2html');
@@ -156,8 +157,15 @@ module.exports = {
 
   handle_copyStreamError(conid, database, { copyStreamError }) {
     const { progressName } = copyStreamError;
-    const { runid } = progressName;
-    logger.error(`DBGM-00103 Error in database connection ${conid}, database ${database}: ${copyStreamError}`);
+    const runid = progressName?.runid;
+    logger.error({ conid, database, copyStreamError }, 'DBGM-00000 Error in database connection copy stream');
+    if (!runid) return;
+    if (copyStreamError.dbgateCopyStreamErrorReported) return;
+    socket.emit(`runner-progress-${runid}`, {
+      progressName: progressName?.name,
+      status: 'error',
+      errorMessage: copyStreamError.message,
+    });
     socket.emit(`runner-done-${runid}`);
   },
 
@@ -194,6 +202,8 @@ module.exports = {
     );
     pipeForkLogs(subprocess);
     const lastClosed = this.closed[`${conid}/${database}`];
+    const initialStatusName =
+      !lastClosed && !(connection.useSeparateSchemas && !isCompositeDbName(database)) ? 'loadStructure' : 'pending';
     const newOpened = {
       conid,
       database,
@@ -201,7 +211,7 @@ module.exports = {
       structure: lastClosed ? lastClosed.structure : DatabaseAnalyser.createEmptyStructure(),
       serverVersion: lastClosed ? lastClosed.serverVersion : null,
       connection,
-      status: { name: 'pending' },
+      status: { name: initialStatusName },
     };
     this.opened.push(newOpened);
     subprocess.on('message', message => {
@@ -235,6 +245,15 @@ module.exports = {
     });
     subprocess.send(connectMessage);
     return newOpened;
+  },
+
+  async ensureStructureLoaded(conid, database) {
+    const conn = await this.ensureOpened(conid, database);
+    if (conn.isApiConnection || !conn.subprocess) {
+      return conn.structure ?? {};
+    }
+    const response = await this.sendRequest(conn, { msgtype: 'getStructure' });
+    return response.structure ?? conn.structure ?? {};
   },
 
   /** @param {import('dbgate-types').OpenedDatabaseConnection} conn */
@@ -512,6 +531,21 @@ module.exports = {
       };
     }
     return res.result || null;
+  },
+
+  saveQueryResultData_meta: true,
+  async saveQueryResultData({ conid, database, changeSet, sql }, req) {
+    await testConnectionPermission(conid, req);
+    await testDatabaseRolePermission(conid, database, 'run_script', req);
+
+    const opened = await this.ensureOpened(conid, database);
+    const res = await this.sendRequest(opened, { msgtype: 'saveQueryResultData', changeSet, sql });
+    if (res.errorMessage) {
+      return {
+        errorMessage: res.errorMessage,
+      };
+    }
+    return res.result || { state: 'ok' };
   },
 
   multiCallMethod_meta: true,

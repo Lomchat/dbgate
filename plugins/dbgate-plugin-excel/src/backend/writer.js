@@ -1,11 +1,39 @@
 const xlsx = require('xlsx');
 const stream = require('stream');
 
+const MAX_SHEET_NAME_LENGTH = 31;
+// Excel preserves only 15 significant digits; use 10^15-1 as the safe threshold.
+const EXCEL_MAX_SAFE = BigInt(999_999_999_999_999);
+const EXCEL_MIN_SAFE = -EXCEL_MAX_SAFE;
 const writingWorkbooks = {};
+
+function isSafeForExcel(bigintValue) {
+  return bigintValue >= EXCEL_MIN_SAFE && bigintValue <= EXCEL_MAX_SAFE;
+}
+
+function normalizeExcelValue(value) {
+  if (typeof value === 'bigint') {
+    return isSafeForExcel(value) ? Number(value) : value.toString();
+  }
+  if (value !== null && typeof value === 'object') {
+    if (value.$decimal !== undefined) {
+      return value.$decimal;
+    }
+    if (value.$bigint !== undefined) {
+      const bi = BigInt(value.$bigint);
+      return isSafeForExcel(bi) ? Number(bi) : value.$bigint;
+    }
+    if (value.$binary?.base64 !== undefined) {
+      return value.$binary.base64;
+    }
+  }
+  return value;
+}
 
 async function saveExcelFiles() {
   for (const file in writingWorkbooks) {
     xlsx.writeFile(writingWorkbooks[file], file);
+    delete writingWorkbooks[file];
   }
 }
 
@@ -28,7 +56,7 @@ class ExcelSheetWriterStream extends stream.Writable {
   }
   _write(chunk, enc, next) {
     if (this.structure) {
-      this.rows.push(this.structure.columns.map((col) => chunk[col.columnName]));
+      this.rows.push(this.structure.columns.map((col) => normalizeExcelValue(chunk[col.columnName])));
     } else {
       this.structure = chunk;
       this.rows.push(chunk.columns.map((x) => x.columnName));
@@ -39,7 +67,18 @@ class ExcelSheetWriterStream extends stream.Writable {
 
   _final(callback) {
     const workbook = createWorkbook(this.fileName);
-    xlsx.utils.book_append_sheet(workbook, xlsx.utils.aoa_to_sheet(this.rows), this.sheetName || 'Sheet 1');
+    const existingLower = new Set(workbook.SheetNames.map((n) => n.toLowerCase()));
+    const base = (this.sheetName || 'Sheet 1').substring(0, MAX_SHEET_NAME_LENGTH);
+    let sheetName = base;
+    if (existingLower.has(sheetName.toLowerCase())) {
+      let counter = 1;
+      do {
+        const suffix = `_${counter}`;
+        sheetName = base.substring(0, MAX_SHEET_NAME_LENGTH - suffix.length) + suffix;
+        counter++;
+      } while (existingLower.has(sheetName.toLowerCase()));
+    }
+    xlsx.utils.book_append_sheet(workbook, xlsx.utils.aoa_to_sheet(this.rows), sheetName);
     callback();
   }
 }

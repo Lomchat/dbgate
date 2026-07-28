@@ -9,6 +9,89 @@ Builds:
 - linux - application for linux
 - win - application for Windows
 
+## 7.2.3
+
+- ADDED: Read-only MCP server support (Community, Docker)
+- ADDED: Advanced MCP server capabilities, including query execution, data modification, and granular access control (Team Premium)
+- FIXED: Filter action buttons not being accessible when no rows match the active filter
+- ADDED: Character encoding selection for decoding binary cell values
+- ADDED: Improved SQL Server to MySQL data type conversion
+- ADDED: Decimal as a PostgreSQL dialect data type option #1490
+- FIXED: MySQL autocomplete for queries containing PARTITION clauses #1500
+
+## 7.2.1
+
+- ADDED: Editable view (Premium)
+- ADDED: MySQL ON UPDATE expression support to column definitions #1170
+- FIXED: Excel export in toolbar #1418
+- ADDED: Admin team files export (Team Premium)
+- ADDED: loggedUserCount added to health status (Team Premium)
+
+## 7.2.0
+
+- ADDED: Editable query results (Premium)
+- ADDED: Option to minify JSON when editing cell values #1477
+- FIXED: Improved spacing for numeric values in the data grid #1467
+- ADDED: Sticky scrolling for log messages #1444
+
+## 7.1.13
+
+- FIXED: Resolved scrolling issues in DataGrid
+- FIXED: Corrected enum select dropdown positioning #1216
+- FIXED: Improved Excel export handling for numeric columns #1464
+- ADDED: Spinner for backup file downloads #1314
+
+## 7.1.12
+
+- FIXED: Resolved DataGrid scrolling issues #1458, #1428, #1402, #1043, #686, #338
+- FIXED: Application crash when using external sort with JSONL files
+- FIXED: Application crash caused by invalid geometry/geography points #1450
+- CHANGED: Improved column resizing usability by increasing the resize handle area #1383
+- ADDED: Displaying schema information in database search #1449
+- CHANGED: Campaigns migrated to new infrastructure, improving availability
+- CHANGED: Improved performance for large databases
+
+## 7.1.11
+
+- CHANGED: AI Gateway migrated; endpoints now on new infrastructure, improving availability
+- CHANGED: Auth proxy migrated; endpoints now on new infrastructure, improving trial and licence availability
+- ADDED: Option to preserve logs #1446
+- CHANGED: Improved loading state handling for database connections and SQL object list components
+
+## 7.1.10
+
+- CHANGED: Private DbGate cloud migrated; endpoints now on new infrastructure, improving availability
+- CHANGED: DbGate Identity migrated, improving availability; requires upgrading to the new version; not backward compatible
+- FIXED: Excel export now correctly handles long table names #1441
+- FIXED: Sometimes SQL file is saved to incorrect team folder (Team Premium)
+
+## 7.1.9
+
+- FIXED: writeQueryHistory function error #1432
+- FIXED: UUID parsing issues #1434, #1431
+- ADDED: Validation for function and file names, fixed security issues
+- CHANGED: Public DbGate cloud migrated; endpoints now on new infrastructure, improving availability
+
+## 7.1.8
+
+- FIXED: NPM packages build
+
+## 7.1.7
+
+- FIXED: Resolved duplicate translation tags #1420
+- FIXED: Referer error on map display #1418
+- FIXED: Export failure when password mode is enabled #1409
+- FIXED: Unreadable text in export #1408
+- FIXED: Column names set to "undefined" in export #1406
+- FIXED: Fixed freezing issues with large fields #1399
+- ADDED: "Fetch All" button #1398
+- ADDED: Option to disable AI features
+- ADDED: PostgreSQL loading optimalization
+
+## 7.1.6
+
+- FIXED: Issues with cloud and file loading
+
 ## 7.1.5
 
 - FIXED: Issues with cloud and file loading

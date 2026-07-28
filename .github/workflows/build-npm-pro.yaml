@@ -35,7 +35,7 @@ jobs:
           repository: dbgate/dbgate-pro
           token: ${{ secrets.GH_TOKEN }}
           path: dbgate-pro
-          ref: 5baa88d0ad253537298e911868579bae0835888d
+          ref: a2670f90dac3ed3b3320f70d80b8a263457fff16
       - name: Merge dbgate/dbgate-pro
         run: |
           mkdir ../dbgate-pro
@@ -53,7 +53,7 @@ jobs:
           cd dbgate-merged
           node adjustNpmPackageJsonPremium
       - name: Update npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
       - name: Remove dbmodel - should be not published
         run: |
           cd ..

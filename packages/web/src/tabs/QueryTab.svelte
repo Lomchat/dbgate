@@ -24,7 +24,7 @@
     name: __t('command.query.AiAssistant', { defaultMessage: 'AI Assistant' }),
     keyText: 'Shift+Alt+A',
     icon: 'icon ai',
-    testEnabled: () => isProApp(),
+    testEnabled: () => isProApp() && !isAiDisabled(),
     onClick: () => getCurrentEditor().toggleAiAssistant(),
   });
   registerCommand({
@@ -42,6 +42,14 @@
     keyText: 'CtrlOrCommand+Shift+R',
     testEnabled: () => !!getCurrentEditor(),
     onClick: () => getCurrentEditor().toggleVisibleResultTabs(),
+  });
+  registerCommand({
+    id: 'query.saveResult',
+    category: __t('command.query', { defaultMessage: 'Query' }),
+    name: __t('command.query.saveResult', { defaultMessage: 'Save result changes' }),
+    icon: 'icon save',
+    testEnabled: () => getCurrentEditor()?.canSaveQueryResult(),
+    onClick: () => getCurrentEditor().saveQueryResult(),
   });
   registerFileCommands({
     idPrefix: 'query',
@@ -138,7 +146,7 @@
   import { currentEditorWrapEnabled, extensions } from '../stores';
   import applyScriptTemplate from '../utility/applyScriptTemplate';
   import { changeTab, markTabUnsaved, sleep } from '../utility/common';
-  import { getDatabaseInfo, useConnectionInfo, useSettings } from '../utility/metadataLoaders';
+  import { getDatabaseInfo, useConnectionInfo, useDatabaseInfo, useSettings } from '../utility/metadataLoaders';
   import SocketMessageView from '../query/SocketMessageView.svelte';
   import useEffect from '../utility/useEffect';
   import ResultTabs from '../query/ResultTabs.svelte';
@@ -150,8 +158,9 @@
   import { findEngineDriver, getSqlFrontMatter, safeJsonParse, setSqlFrontMatter } from 'dbgate-tools';
   import AceEditor from '../query/AceEditor.svelte';
   import StatusBarTabItem from '../widgets/StatusBarTabItem.svelte';
-  import { showSnackbarError } from '../utility/snackbar';
+  import { showSnackbarError, showSnackbarSuccess } from '../utility/snackbar';
   import { apiCall, apiOff, apiOn } from '../utility/api';
+  import { pingSession } from '../utility/sessionPinger';
   import ToolStripCommandButton from '../buttons/ToolStripCommandButton.svelte';
   import ToolStripContainer from '../buttons/ToolStripContainer.svelte';
   import ToolStripExportButton, { createQuickExportHandlerRef } from '../buttons/ToolStripExportButton.svelte';
@@ -161,10 +170,11 @@
   import ToolStripDropDownButton from '../buttons/ToolStripDropDownButton.svelte';
   import { extractQueryParameters, replaceQueryParameters } from 'dbgate-query-splitter';
   import QueryParametersModal from '../modals/QueryParametersModal.svelte';
+  import ConfirmSqlModal from '../modals/ConfirmSqlModal.svelte';
   import HorizontalSplitter from '../elements/HorizontalSplitter.svelte';
   import uuidv1 from 'uuid/v1';
   import ToolStripButton from '../buttons/ToolStripButton.svelte';
-  import { getIntSettingsValue } from '../settings/settingsTools';
+  import { getIntSettingsValue, isAiDisabled } from '../settings/settingsTools';
   import RowsLimitModal from '../modals/RowsLimitModal.svelte';
   import _ from 'lodash';
   import FontIcon from '../icons/FontIcon.svelte';
@@ -197,19 +207,19 @@
     },
     {
       value: '@',
-      text: _t('query.variable', { defaultMessage: '@variable' }),
+      text: '@' + _t('query.variable', { defaultMessage: 'variable' }),
     },
     {
       value: ':',
-      text: _t('query.named', { defaultMessage: ':variable' }),
+      text: ':' + _t('query.variable', { defaultMessage: 'variable' }),
     },
     {
       value: '$',
-      text: _t('query.variable', { defaultMessage: '$variable' }),
+      text: '$' + _t('query.variable', { defaultMessage: 'variable' }),
     },
     {
       value: '#',
-      text: _t('query.variable', { defaultMessage: '#variable' }),
+      text: '#' + _t('query.variable', { defaultMessage: 'variable' }),
     },
   ];
 
@@ -246,6 +256,7 @@
   }
 
   const settingsValue = useSettings();
+  const dbinfo = useDatabaseInfo({ conid, database });
 
   let queryRowsLimit = getInitialRowsLimit();
   $: localStorage.setItem(queryRowsLimitLocalStorageKey, queryRowsLimit ? queryRowsLimit.toString() : 'nolimit');
@@ -253,12 +264,17 @@
   let isAiAssistantVisible = isProApp() && localStorage.getItem(`tabdata_isAiAssistantVisible_${tabid}`) == 'true';
   let domAiAssistant;
 
+  $: if ($settingsValue?.['storage.disableAiFeatures']) {
+    isAiAssistantVisible = false;
+  }
+
   onMount(() => {
-    intervalId = setInterval(() => {
+    intervalId = setInterval(async () => {
       if (!driver?.singleConnectionOnly && sessionId) {
-        apiCall('sessions/ping', {
-          sesid: sessionId,
-        });
+        const pingedSessionId = sessionId;
+        if (!(await pingSession(pingedSessionId)) && sessionId == pingedSessionId) {
+          handleSessionClosed();
+        }
       }
     }, 15 * 1000);
   });
@@ -328,6 +344,33 @@
 
   export function toggleVisibleResultTabs() {
     visibleResultTabs = !visibleResultTabs;
+  }
+
+  export function canSaveQueryResult() {
+    return domResultTabs?.canSaveQueryResult?.();
+  }
+
+  export async function saveQueryResult() {
+    const saveInfo = domResultTabs?.getQueryResultSaveInfo?.();
+    if (!saveInfo) return;
+    showModal(ConfirmSqlModal, {
+      sql: saveInfo.sql,
+      engine: saveInfo.engine,
+      runAgainCheckbox: true,
+      onConfirm: (confirmedSql, values) => handleConfirmQueryResultSave(saveInfo, confirmedSql, values),
+    });
+  }
+
+  async function handleConfirmQueryResultSave(saveInfo, confirmedSql, values = null) {
+    const res = await domResultTabs?.saveQueryResult?.(saveInfo, confirmedSql);
+    if (res?.errorMessage) {
+      showSnackbarError(res.errorMessage);
+      return;
+    }
+    showSnackbarSuccess(_t('query.resultChangesSaved', { defaultMessage: 'Result changes saved' }));
+    if (values?.runAgainAfterSave) {
+      await execute();
+    }
   }
 
   export function toggleAiAssistant() {
@@ -582,6 +625,7 @@
 
   const handleSessionClosed = () => {
     sessionId = null;
+    isInTransaction = false;
     handleSessionDone();
   };
 
@@ -619,7 +663,7 @@
   }
 
   async function handleExplainError(errorObject) {
-    if (!isProApp()) return;
+    if (!isProApp() || isAiDisabled()) return;
     isAiAssistantVisible = true;
     await tick();
     domAiAssistant?.explainError({
@@ -776,14 +820,23 @@
             tabs={[{ label: _t('query.Messages', { defaultMessage: 'Messages' }), slot: 0 }]}
             {sessionId}
             {executeNumber}
+            {conid}
+            {database}
             bind:resultCount
             {driver}
+            dbinfo={$dbinfo}
+            autoCommit={driver?.implicitTransactions && isAutocommit}
+            onQueryResultChanges={() => {
+              invalidateCommands();
+            }}
+            onSaveQueryResult={saveQueryResult}
             onSetFrontMatterField={handleSetFrontMatterField}
             onGetFrontMatter={() => getSqlFrontMatter($editorValue, yaml)}
           >
             <svelte:fragment slot="0">
               <SocketMessageView
                 eventName={sessionId ? `session-info-${sessionId}` : null}
+                {executeNumber}
                 onMessageClick={handleMesageClick}
                 startLine={executeStartLine}
                 showProcedure
