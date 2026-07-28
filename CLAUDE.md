@@ -16,16 +16,16 @@ Il n'existe que **deux** emplacements DbGate sur ce serveur : ce dépôt, et les
 
 | Chemin | Rôle | Versionné ? |
 |---|---|---|
-| `/srv/dbgate-dev` | **Ce dépôt.** Les sources modifiables, c'est ici qu'on code. | oui |
-| `/srv/dbgate-dev/runtime/` | **L'instance qui tourne** : paquet npm `dbgate-serve@7.1.6`. Lancée par le service systemd `dbgate.service` sur le port 9999. | non (gitignore) |
-| `/srv/dbgate-dev/backup/` | Sauvegardes horodatées du front, déposées par `deploy.sh` | non (gitignore) |
+| `/srv/dbgate` | **Ce dépôt.** Les sources modifiables, c'est ici qu'on code. | oui |
+| `/srv/dbgate/runtime/` | **L'instance qui tourne** : paquet npm `dbgate-serve@7.1.6`. Lancée par le service systemd `dbgate.service` sur le port 9999. | non (gitignore) |
+| `/srv/dbgate/backup/` | Sauvegardes horodatées du front, déposées par `deploy.sh` | non (gitignore) |
 | `/root/.dbgate` | **Les données** : connexions, mots de passe, historique, thèmes. Jamais dans le dépôt. | non |
 
 Le service pointe directement dans ce dépôt :
 ```ini
-WorkingDirectory=/srv/dbgate-dev/runtime
-EnvironmentFile=/srv/dbgate-dev/runtime/.env     # PORT=9999, LOGIN_PASSWORD_admin
-ExecStart=<node20> /srv/dbgate-dev/runtime/node_modules/dbgate-serve/bin/dbgate-serve.js
+WorkingDirectory=/srv/dbgate/runtime
+EnvironmentFile=/srv/dbgate/runtime/.env     # PORT=9999, LOGIN_PASSWORD_admin
+ExecStart=<node20> /srv/dbgate/runtime/node_modules/dbgate-serve/bin/dbgate-serve.js
 ```
 
 > Pourquoi un runtime npm plutôt qu'un lancement direct depuis les sources ? Parce que l'API résout le
@@ -42,10 +42,10 @@ Accès public : `https://<DOMAINE>` → Apache (`/etc/httpd/conf.d/<DOMAINE>.con
 
 ```sh
 # 1. Editer les sources du front
-vim /srv/dbgate-dev/packages/web/src/<composant>.svelte
+vim /srv/dbgate/packages/web/src/<composant>.svelte
 
 # 2. Deployer  (~20 s de build + ~2 s de redemarrage)
-/srv/dbgate-dev/deploy.sh
+/srv/dbgate/deploy.sh
 
 # 3. Ctrl+Shift+R dans le navigateur
 ```
@@ -98,8 +98,8 @@ et sauvegarde l'existant dans `backup/public.<horodatage>` avant chaque bascule.
 
 Rollback :
 ```sh
-rsync -a --delete /srv/dbgate-dev/backup/public.<horodatage>/ \
-                  /srv/dbgate-dev/runtime/node_modules/dbgate-web/public/
+rsync -a --delete /srv/dbgate/backup/public.<horodatage>/ \
+                  /srv/dbgate/runtime/node_modules/dbgate-web/public/
 systemctl restart dbgate.service
 ```
 
@@ -140,11 +140,11 @@ git log --oneline v7.1.6..upstream/master
 - **Rester sur `v7.1.6`.** Le front déployé doit correspondre à la version de `dbgate-serve` installée.
   Une montée de version du fork sans montée équivalente de l'instance casse le contrat d'API.
 - **Node 20 obligatoire** (`nvm use 20`). Le shell par défaut est en Node 16, qui ne sait pas builder ce projet.
-- **`packages/api/.env` contient `WORKSPACE_DIR=/srv/dbgate-dev-data`.** Ce garde-fou empêche le serveur de dev
+- **`packages/api/.env` contient `WORKSPACE_DIR=/srv/dbgate-data`.** Ce garde-fou empêche le serveur de dev
   (`yarn start`) d'écrire dans les vraies données. Le dossier est recréé vide au besoin. Ne jamais le
   faire pointer vers `/root/.dbgate`.
 - **`/root/.dbgate/.key`** chiffre les mots de passe des connexions. Le perdre les rend définitivement illisibles.
-  Sauvegarde : `tar czf backup.tar.gz /root/.dbgate /srv/dbgate-dev/runtime/.env`
+  Sauvegarde : `tar czf backup.tar.gz /root/.dbgate /srv/dbgate/runtime/.env`
 - **Licence GPL-3.0.** Modifier et utiliser en interne n'impose rien. Publier ou redistribuer une version modifiée
   oblige à en publier les sources sous GPL. Conserver `LICENSE` et les en-têtes de copyright.
 
@@ -161,7 +161,7 @@ git log --oneline v7.1.6..upstream/master
 La boucle `deploy.sh` prenant ~20 s, le serveur de dev n'apporte pas grand-chose ici. Il reste pertinent
 pour expérimenter sans jamais toucher à l'instance publique :
 ```sh
-cd /srv/dbgate-dev && yarn start                  # API sur 3000, watch rolldown, données isolées
+cd /srv/dbgate && yarn start                  # API sur 3000, watch rolldown, données isolées
 ssh -L 3000:127.0.0.1:3000 <USER>@<IP-SERVEUR>    # depuis le poste client, port 3000 fermé au pare-feu
 ```
 Attention : ce mode produit un bundle avec `API_URL=http://localhost:3000` codé en dur — **ne jamais le déployer**.

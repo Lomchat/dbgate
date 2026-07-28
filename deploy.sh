@@ -1,6 +1,6 @@
 #!/bin/bash
 # Deploie le front DbGate modifie vers le runtime npm embarque dans ce depot.
-# Usage : /srv/dbgate-dev/deploy.sh
+# Usage : /srv/dbgate/deploy.sh
 set -e
 
 export NVM_DIR="/root/.nvm"
@@ -8,7 +8,7 @@ export NVM_DIR="/root/.nvm"
 nvm use 20 >/dev/null 2>&1
 unset PORT API_URL
 
-REPO=/srv/dbgate-dev
+REPO=/srv/dbgate
 SRC=$REPO/packages/web/public/
 DST=$REPO/runtime/node_modules/dbgate-web/public/
 BAK=$REPO/backup/public.$(date +%Y%m%d-%H%M%S)
