@@ -285,6 +285,39 @@ directement dans le runtime. Le script recopie la liste de fichiers déclarée e
 l'original une seule fois dans `backup/api/` et redémarre. Ajouter tout nouveau fichier corrigé à
 la liste `FILES`.
 
+### ⚠️⚠️ Le réseau sortant du serveur perd des paquets
+
+**À vérifier avant toute optimisation de DbGate.** Mesuré ici, 12 tentatives d'ouverture TCP
+espacées de 2 s :
+
+| Destination | Réussite |
+|---|---|
+| `127.0.0.1:9999` (témoin) | **12/12** |
+| Cloudflare `1.1.1.1:443` | 5/12 |
+| Google DNS `8.8.8.8:53` | 2/12 |
+| Base distante | 3/12 |
+
+**60 à 80 % des connexions sortantes échouent, quelle que soit la destination.** Le témoin local est
+parfait, la charge et conntrack sont bas : la machine va bien, c'est le réseau du fournisseur.
+
+Conséquences, toutes vérifiées pendant l'enquête :
+
+- Une connexion qui aboutit prend ~22 ms ; une qui échoue **pend jusqu'au timeout** du client.
+- Toute mesure de performance devient ininterprétable. Deux hypothèses ont été retenues puis
+  **infirmées** faute d'échantillon : `directConnection=true` pour Mongo (rapide une fois, lent la
+  suivante) et une limitation ciblée sur les ports base de données (démentie dès que SSH a échoué
+  aussi). **Ne jamais conclure sur moins d'une dizaine de tentatives.**
+- Les chiffres ronds — 15 s, 30 s — sont des expirations, jamais du calcul.
+
+Atténuation côté DbGate (le réseau reste à corriger chez l'hébergeur) :
+
+- `connectTimeoutMS: 4000` dans le driver Mongo, au lieu des 30 s par défaut. Une tentative perdue
+  est abandonnée vite et le driver en relance une autre dans le budget de sélection de serveur, au
+  lieu d'attendre une seule fois très longtemps. Mesuré : pire attente **30 016 ms → 4 578 ms**, à
+  taux de réussite égal. Réglable par `MONGO_CONNECT_TIMEOUT_MS`.
+- Connexions maintenues 10 min (voir plus haut) : moins de reconnexions, donc moins d'occasions de
+  tomber sur une perte.
+
 ### Lenteur de chargement des collections Mongo
 
 L'arbre mettait 15 à 31 secondes à apparaître sur certaines bases Mongo. Décomposition mesurée :

@@ -122,6 +122,15 @@ const drivers = driverBases.map((driverBase) => ({
 
     const options = {
       // useUnifiedTopology: true, // this options has no longer effect
+
+      // Le driver laisse connectTimeoutMS a 30 s par defaut. Sur un reseau qui perd des
+      // paquets, une seule tentative pendue consomme donc tout le budget de selection de
+      // serveur et l'ouverture echoue au bout de 30 s, alors qu'une connexion qui aboutit
+      // prend ~22 ms. En abaissant ce delai, une tentative perdue est abandonnee vite et le
+      // driver en relance une autre a l'interieur de serverSelectionTimeoutMS, au lieu
+      // d'attendre une seule fois tres longtemps.
+      // Reglable par MONGO_CONNECT_TIMEOUT_MS.
+      connectTimeoutMS: parseInt(process.env.MONGO_CONNECT_TIMEOUT_MS, 10) || 4000,
     };
     if (ssl) {
       options.tls = true;
