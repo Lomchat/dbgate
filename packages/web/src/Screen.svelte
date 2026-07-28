@@ -11,6 +11,8 @@
     visibleTitleBar,
     rightPanelWidget,
     rightPanelWidth,
+    visibleSecondLeftPanel,
+    secondLeftPanelWidth,
   } from './stores';
   import CommandPalette from './commands/CommandPalette.svelte';
   import splitterDrag from './utility/splitterDrag';
@@ -26,6 +28,7 @@
   import MultiTabsContainer from './tabpanel/MultiTabsContainer.svelte';
   import { currentThemeType } from './plugins/themes';
   import RightWidgetContainer from './widgets/RightWidgetContainer.svelte';
+  import SecondLeftPanelContainer from './widgets/SecondLeftPanelContainer.svelte';
 
   $: currentThemeTypeClass = $currentThemeType == 'dark' ? 'theme-type-dark' : 'theme-type-light';
 
@@ -63,11 +66,23 @@
   <div class="tabs-container">
     <MultiTabsContainer />
   </div>
+  {#if $visibleSecondLeftPanel}
+    <div class="secondleftpanel">
+      <SecondLeftPanelContainer />
+    </div>
+  {/if}
   {#if $selectedWidget && $visibleWidgetSideBar}
     <div
       class="horizontal-split-handle left-splitter"
       use:splitterDrag={'clientX'}
       on:resizeSplitter={e => leftPanelWidth.update(x => x + e.detail)}
+    />
+  {/if}
+  {#if $visibleSecondLeftPanel}
+    <div
+      class="horizontal-split-handle second-left-splitter"
+      use:splitterDrag={'clientX'}
+      on:resizeSplitter={e => secondLeftPanelWidth.update(x => x + e.detail)}
     />
   {/if}
   {#if $rightPanelWidget}
@@ -138,6 +153,20 @@
     border-right: var(--theme-sidebar-border);
   }
 
+  /* Deuxieme colonne : pleine hauteur, collee au bord droit du panneau de gauche.
+     Elle participe a --dim-content-left, donc le contenu se decale tout seul. */
+  .secondleftpanel {
+    position: fixed;
+    top: var(--dim-header-top);
+    left: var(--dim-second-left-panel-left);
+    bottom: var(--dim-statusbar-height);
+    width: var(--dim-second-left-panel-width);
+    background-color: var(--theme-sidebar-background);
+    color: var(--theme-sidebar-foreground);
+    display: flex;
+    border-right: var(--theme-sidebar-border);
+  }
+
   .rightpanel {
     position: fixed;
     top: var(--dim-header-top);
@@ -168,6 +197,13 @@
     top: var(--dim-header-top);
     bottom: var(--dim-statusbar-height);
     left: calc(var(--dim-widget-icon-size) + var(--dim-left-panel-width));
+  }
+
+  .second-left-splitter {
+    position: absolute;
+    top: var(--dim-header-top);
+    bottom: var(--dim-statusbar-height);
+    left: var(--dim-content-left);
   }
 
   .right-splitter {

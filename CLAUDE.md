@@ -156,6 +156,7 @@ git log --oneline v7.1.6..upstream/master
 - `packages/web/src/tabs/SettingsTab.svelte` — ajout de l'entrée « Upgrade to Premium » sous « Keyboard shortcuts »
 - `packages/web/src/widgets/WidgetIconPanel.svelte` — infobulles sur le rail d'icônes de gauche
   (voir ci-dessous)
+- **Deuxième colonne de sidebar détachable** — voir la section dédiée plus bas
 - `deploy.sh` — **nouveau** : script de build et de déploiement
 
 ### Infobulles du rail d'icônes
@@ -197,6 +198,37 @@ paraissait correct. Les styles calculés ne suffisent pas : il faut le rendu.
 > Détail à connaître : l'infobulle porte `pointer-events: none`, donc `elementFromPoint()` la
 > traverse et signale un faux recouvrement. Le script neutralise temporairement cette propriété
 > pendant le test.
+
+### Deuxième colonne de sidebar détachable
+
+Le bouton dans l'en-tête des sections de contenu (« Tables, vues, fonctions », « Database content »…)
+bascule ce bloc entre deux dispositions : empilé sous les connexions, ou en **colonne autonome pleine
+hauteur** à droite du panneau de gauche, avec son propre splitter.
+
+| Fichier | Rôle |
+|---|---|
+| `stores.ts` | `detachedDbObjects`, `secondLeftPanelWidth` (persistés), `visibleSecondLeftPanel` (dérivé) |
+| `public/dimensions.css` | `--dim-second-left-panel-width`, `--dim-visible-second-left-panel`, intégrées à `--dim-content-left` |
+| `Screen.svelte` | `.secondleftpanel` + `.second-left-splitter` |
+| `widgets/SecondLeftPanelContainer.svelte` | **nouveau** : réenveloppe le contenu dans son propre `WidgetColumnBar` |
+| `widgets/WidgetTitle.svelte` | `onAction` / `actionIcon` / `actionTitle` — bouton générique dans l'en-tête |
+| `widgets/DatabaseWidget.svelte` | rendu conditionnel + `{#key}` |
+
+Le décalage du contenu est **automatique** : `--dim-content-left` intègre la largeur de la deuxième
+colonne, et tout le layout en dépend déjà. Aucun composant n'a eu besoin d'être modifié pour ça.
+
+⚠️ **`WidgetColumnBar` n'oublie jamais ses sections.** `pushWidgetItemDefinition` empile les
+définitions au montage et rien ne les retire au démontage. Les sections parties dans l'autre colonne
+continuaient donc d'y réserver leur hauteur — la liste des connexions restait à 412px dans un panneau
+de 878px, avec un grand vide dessous. D'où le `{#key $detachedDbObjects}` qui force la reconstruction
+de la barre. Toute manipulation dynamique de sections rencontrera ce piège.
+
+⚠️ `DatabaseWidgetDetailContent` n'émet que des `<WidgetColumnBarItem>`, qui exigent le contexte
+d'un `<WidgetColumnBar>` parent. Il ne peut donc pas être monté seul : d'où le composant d'enveloppe,
+avec un `storageName` distinct pour que les hauteurs des deux dispositions ne se mélangent pas.
+
+> Le bouton est posé sur **toutes** les sections de contenu, pas seulement « Tables, vues, fonctions ».
+> Sans base sélectionnée, seule la section d'attente s'affiche : sans cela, impossible de revenir en arrière.
 
 ### Raccourcis clavier rendus au navigateur
 

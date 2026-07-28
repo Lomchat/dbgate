@@ -5,6 +5,10 @@
   export let onClose = null;
   export let altsidebar = false;
   export let collapsed = false;
+  // Bouton optionnel a droite du titre, en plus de la croix de fermeture.
+  export let onAction = null;
+  export let actionIcon = null;
+  export let actionTitle = null;
 </script>
 
 <div on:click class:clickable {...$$restProps} class="wrapper" class:altsidebar>
@@ -14,6 +18,21 @@
     {/if}
     <slot />
   </div>
+  {#if onAction}
+    <div
+      class="close"
+      title={actionTitle}
+      aria-label={actionTitle}
+      data-testid="WidgetTitle_action"
+      on:click={e => {
+        // Le titre est cliquable pour replier la section : ne pas declencher les deux.
+        e.stopPropagation();
+        onAction();
+      }}
+    >
+      <FontIcon icon={actionIcon} />
+    </div>
+  {/if}
   {#if onClose}
     <div class="close" on:click={onClose}>
       <FontIcon icon="icon close" />

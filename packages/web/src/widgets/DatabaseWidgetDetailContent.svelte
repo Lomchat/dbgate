@@ -1,6 +1,13 @@
 <script lang="ts">
   import { findEngineDriver } from 'dbgate-tools';
-  import { currentDatabase, extensions, pinnedDatabases, pinnedTables, selectedWidget } from '../stores';
+  import {
+    currentDatabase,
+    detachedDbObjects,
+    extensions,
+    pinnedDatabases,
+    pinnedTables,
+    selectedWidget,
+  } from '../stores';
   import { useConnectionInfo } from '../utility/metadataLoaders';
 
   import PinnedObjectsList from './PinnedObjectsList.svelte';
@@ -24,6 +31,16 @@
   $: driver = findEngineDriver($connection, $extensions);
   $: singleDatabase = $currentDatabase?.connection?.singleDatabase;
   $: database = $currentDatabase?.name;
+
+  // Bouton de detachement, pose sur toutes les sections de contenu : sans base selectionnee
+  // seule la section d'attente est affichee, et il faut pouvoir revenir en arriere depuis elle.
+  $: detachAction = {
+    onAction: () => ($detachedDbObjects = !$detachedDbObjects),
+    actionIcon: $detachedDbObjects ? 'icon arrow-left' : 'icon arrow-right',
+    actionTitle: $detachedDbObjects
+      ? _t('widget.attachDbObjects', { defaultMessage: 'Dock back under Connections' })
+      : _t('widget.detachDbObjects', { defaultMessage: 'Move to its own column' }),
+  };
 
   $: correctCloudStatus =
     !conid ||
@@ -53,6 +70,7 @@
     (driver?.databaseEngineTypes?.includes('sql') || driver?.databaseEngineTypes?.includes('document'))
   )}
   positiveCondition={correctCloudStatus}
+  {...detachAction}
 >
   <SqlObjectList {conid} {database} bind:this={domSqlObjectList} />
 </WidgetColumnBarItem>
@@ -62,6 +80,7 @@
   name="dbObjectsKeyValue"
   skip={!(conid && (database || singleDatabase) && driver?.databaseEngineTypes?.includes('keyvalue'))}
   positiveCondition={correctCloudStatus}
+  {...detachAction}
 >
   <RedisKeysTree {conid} {database} treeKeySeparator={$connection?.treeKeySeparator || ':'} />
 </WidgetColumnBarItem>
@@ -71,6 +90,7 @@
   name="endpoints"
   skip={!(conid && (database || singleDatabase) && driver?.databaseEngineTypes?.includes('rest'))}
   positiveCondition={correctCloudStatus}
+  {...detachAction}
 >
   <RestApiContentWidget {conid} />
 </WidgetColumnBarItem>
@@ -80,6 +100,7 @@
   name="dbObjectsFocused"
   skip={conid && (database || singleDatabase)}
   positiveCondition={correctCloudStatus}
+  {...detachAction}
 >
   <WidgetsInnerContainer>
     <FocusedConnectionInfoWidget {conid} {database} connection={$connection} />
@@ -93,6 +114,7 @@
   name="dbObjectsError"
   skip={!(conid && (database || singleDatabase) && !driver)}
   positiveCondition={correctCloudStatus}
+  {...detachAction}
 >
   <WidgetsInnerContainer>
     <FocusedConnectionInfoWidget {conid} {database} connection={$connection} />

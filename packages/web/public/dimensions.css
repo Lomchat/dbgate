@@ -7,10 +7,19 @@
   --dim-tabs-panel-height: calc( var(--dim-visible-tabs-databases) * 20px + var(--dim-tabs-height) );
   --dim-splitter-thickness: 4px;
 
+  --dim-second-left-panel-width: 300px; /* set from JS */
+  --dim-visible-second-left-panel: 0; /* set from JS */
+
   --dim-visible-left-panel: 1; /* set from JS */
   --dim-content-left: calc(
     var(--dim-widget-icon-size) + var(--dim-visible-left-panel) *
-      (var(--dim-left-panel-width))
+      (var(--dim-left-panel-width)) + var(--dim-visible-second-left-panel) *
+      (var(--dim-second-left-panel-width))
+  );
+
+  /* Bord gauche de la deuxieme colonne = bord droit du panneau de gauche */
+  --dim-second-left-panel-left: calc(
+    var(--dim-widget-icon-size) + var(--dim-visible-left-panel) * (var(--dim-left-panel-width))
   );
 
   --dim-visible-right-panel: 0; /* set from JS */

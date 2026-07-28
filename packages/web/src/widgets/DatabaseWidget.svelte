@@ -9,6 +9,7 @@
   import _ from 'lodash';
   import { _t } from '../translations';
   import DatabaseWidgetDetailContent from './DatabaseWidgetDetailContent.svelte';
+  import { detachedDbObjects } from '../stores';
 
   export let hidden = false;
   let domSqlObjectList = null;
@@ -17,7 +18,11 @@
   $: cloudContentList = useCloudContentList();
 </script>
 
-<WidgetColumnBar {hidden} storageName="databaseWidget">
+<!-- WidgetColumnBar accumule les definitions de sections au montage et ne les retire jamais.
+     Sans remontage, les sections parties dans la deuxieme colonne continueraient d'y reserver
+     leur hauteur, laissant un vide sous les connexions. -->
+{#key $detachedDbObjects}
+  <WidgetColumnBar {hidden} storageName="databaseWidget">
   {#if $config?.singleConnection}
     <WidgetColumnBarItem title={_t('widget.databases', { defaultMessage: 'Databases' })} name="databases" height="35%">
       <SingleConnectionDatabaseList connection={$config?.singleConnection} />
@@ -26,7 +31,7 @@
     <WidgetColumnBarItem
       title={_t('common.connections', { defaultMessage: 'Connections' })}
       name="connections"
-      height="35%"
+      height={$detachedDbObjects ? null : '35%'}
       storeHeight
     >
       <ConnectionList
@@ -38,5 +43,8 @@
     </WidgetColumnBarItem>
   {/if}
 
-  <DatabaseWidgetDetailContent bind:domSqlObjectList showCloudConnection={false} />
-</WidgetColumnBar>
+    {#if !$detachedDbObjects}
+      <DatabaseWidgetDetailContent bind:domSqlObjectList showCloudConnection={false} />
+    {/if}
+  </WidgetColumnBar>
+{/key}

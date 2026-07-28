@@ -144,6 +144,11 @@ export const draggingDbGroupTarget = writable(null);
 
 export const leftPanelWidth = writableWithStorage(300, 'leftPanelWidth');
 export const rightPanelWidth = writableWithStorage(300, 'rightPanelWidth');
+
+// Detache "Tables, vues, fonctions" du panneau de gauche pour en faire une deuxieme
+// colonne pleine hauteur, a droite des connexions.
+export const detachedDbObjects = writableWithStorage(false, 'detachedDbObjects');
+export const secondLeftPanelWidth = writableWithStorage(300, 'secondLeftPanelWidth');
 export const currentDropDownMenu = writable(null);
 export const openedModals = writable([]);
 export const draggedPinnedObject = writable(null);
@@ -245,8 +250,17 @@ export const visibleHamburgerMenuWidget = derived(useSettings(), $settings => {
   return !!$settings['app.fullscreen'];
 });
 
+// La deuxieme colonne n'existe que sur le widget "database", et seulement si l'utilisateur
+// a demande le detachement. Sur les autres widgets elle disparait et le contenu se recale.
+export const visibleSecondLeftPanel = derived(
+  [visibleSelectedWidget, detachedDbObjects],
+  ([$visibleSelectedWidget, $detachedDbObjects]) => !!$detachedDbObjects && $visibleSelectedWidget == 'database'
+);
+
 subscribeCssVariable(visibleSelectedWidget, x => (x ? 1 : 0), '--dim-visible-left-panel');
 subscribeCssVariable(leftPanelWidth, x => `${x}px`, '--dim-left-panel-width');
+subscribeCssVariable(visibleSecondLeftPanel, x => (x ? 1 : 0), '--dim-visible-second-left-panel');
+subscribeCssVariable(secondLeftPanelWidth, x => `${x}px`, '--dim-second-left-panel-width');
 subscribeCssVariable(rightPanelWidth, x => `${x}px`, '--dim-right-panel-width');
 subscribeCssVariable(visibleTitleBar, x => (x ? 1 : 0), '--dim-visible-titlebar');
 subscribeCssVariable(lockedDatabaseMode, x => (x ? 0 : 1), '--dim-visible-tabs-databases');

@@ -31,6 +31,10 @@
   export let onClose = null;
   export let minimalHeight = 50;
   export let name;
+  // Bouton optionnel dans l'en-tete de section (voir WidgetTitle)
+  export let onAction = null;
+  export let actionIcon = null;
+  export let actionTitle = null;
 
   let lastContentHeight = 0;
   let displayedContentHeight = 0;
@@ -85,6 +89,9 @@
     data-testid={$$props['data-testid']}
     {altsidebar}
     {onClose}
+    {onAction}
+    {actionIcon}
+    {actionTitle}
     collapsed={computed.collapsed}>{title}</WidgetTitle
   >
 
