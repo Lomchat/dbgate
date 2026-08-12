@@ -21,6 +21,19 @@ Il n'existe que **deux** emplacements DbGate sur ce serveur : ce dépôt, et les
 | `/srv/dbgate/backup/` | Sauvegardes horodatées du front, déposées par `deploy.sh` | non (gitignore) |
 | `/root/.dbgate` | **Les données** : connexions, mots de passe, historique, thèmes. Jamais dans le dépôt. | non |
 
+⚠️ **`Restart=always`, et pas `on-failure`.** Le 12/08/2026 à 00:28:06, un signal extérieur a
+éteint DbGate **proprement** (code de sortie 0). `on-failure` ne redémarre pas sur une sortie 0 :
+le service est resté mort **19 heures**, Apache renvoyant `503 Service Unavailable`. `siege.service`
+est tombé à la même seconde et a été relancé 20 s plus tard par une automatisation qui ne couvrait
+pas DbGate. L'origine exacte du signal n'a pas été identifiée — ce serveur héberge plusieurs agents
+qui ouvrent des sessions SSH root en continu.
+
+Vérifier après toute modification de l'unité :
+```sh
+kill -TERM $(systemctl show -p MainPID --value dbgate.service)
+sleep 10 && systemctl is-active dbgate.service   # doit afficher 'active'
+```
+
 Le service pointe directement dans ce dépôt :
 ```ini
 WorkingDirectory=/srv/dbgate/runtime
