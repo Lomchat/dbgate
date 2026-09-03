@@ -136,8 +136,22 @@ Le front déployé vit dans `runtime/node_modules/dbgate-web/public/`. **Un `npm
 `runtime/`, ou une montée de version de `dbgate-serve`, l'écrasera sans prévenir** et les
 personnalisations disparaîtront.
 
-Ce n'est pas une perte : les sources sont ici, il suffit de relancer `deploy.sh`. Mais il ne faut pas
-s'étonner de voir l'interface revenir à son état d'origine après une mise à jour.
+Ce n'est pas une perte : les sources sont ici. **C'est déjà arrivé le 19/08/2026 à 20:49** — front,
+correctif `packages/api/`, plugin Mongo *et* la ligne `/etc/hosts` remis à zéro d'un coup, sans que
+la version de `dbgate-serve` change (7.1.6 → 7.1.6, donc un simple `npm install`).
+
+Pour tout remettre en place d'une commande :
+
+```sh
+/srv/dbgate/restore-all.sh     # front + api + plugin mongo + /etc/hosts, puis verification
+```
+
+Le script relance les trois `deploy*.sh`, remet la ligne dans `/etc/hosts` et **vérifie chaque
+personnalisation** dans les fichiers réellement servis. Ajouter tout nouveau correctif à sa liste
+de contrôles, sinon une disparition passera inaperçue.
+
+Symptôme à reconnaître : `bundle.js` fait exactement **5 689 815 octets** (taille du bundle npm
+d'origine) au lieu de ~5 698 000. Un simple `ls -la` sur le fichier suffit à trancher.
 
 ## ⚠️ Ne jamais utiliser le bouton « Sync fork » de GitHub sur `custom-ui`
 
