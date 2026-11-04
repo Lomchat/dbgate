@@ -211,8 +211,10 @@ function start() {
         process.env.PORT || 3000
       ),
     }).then(port => {
-      server.listen(port, () => {
-        logger.info(`DBGM-00031 DbGate API listening on port ${port} (NPM build)`);
+      // LISTEN_HOST (ce fork) : 127.0.0.1 quand un reverse proxy est devant ; absent = toutes les interfaces, comme avant
+      const host = process.env.LISTEN_HOST || undefined;
+      server.listen(port, host, () => {
+        logger.info(`DBGM-00031 DbGate API listening on ${host || '*'}:${port} (NPM build)`);
       });
     });
   } else if (process.env.DEVWEB) {

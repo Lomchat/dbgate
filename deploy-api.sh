@@ -14,6 +14,7 @@ BAK=$REPO/backup/api
 
 # Fichiers corriges par ce fork. Ajouter ici toute nouvelle correction.
 FILES=(
+  main.js   # LISTEN_HOST : n'ecouter que sur 127.0.0.1 (Caddy relaie db.chalco.website)
   proc/databaseConnectionProcess.js
   proc/serverConnectionProcess.js
 )
