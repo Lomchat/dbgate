@@ -70,10 +70,10 @@ jobs:
             type=match,pattern=\d+.\d+.\d+,suffix=-alpine,enable=${{ !contains(github.ref_name, '-docker.') && !contains(github.ref_name, '-beta.') }}
             type=raw,value=alpine,enable=${{ !contains(github.ref_name, '-docker.') && !contains(github.ref_name, '-beta.') }}
 
-      - name: Use Node.js 22.x
+      - name: Use Node.js 24.x
         uses: actions/setup-node@v1
         with:
-          node-version: 22.x
+          node-version: 24.x
 
       - _include: checkout-and-merge-pro
         _if: _premium
@@ -121,7 +121,7 @@ jobs:
             _premium: ../dbgate-merged/docker
           tags: ${{ steps.meta.outputs.tags }}
           platforms: 
-            _community: linux/amd64,linux/arm64,linux/arm/v7
+            _community: linux/amd64,linux/arm64
             _premium: linux/amd64,linux/arm64
 
 
@@ -133,4 +133,4 @@ jobs:
           context: ./docker
           file: ./docker/Dockerfile-alpine
           tags: ${{ steps.alpmeta.outputs.tags }}
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64

@@ -10,7 +10,7 @@ import {
   visibleWidgetSideBar,
   selectedWidget,
 } from '../stores';
-import registerCommand from './registerCommand';
+import registerCommand, { GlobalCommand } from './registerCommand';
 import { get } from 'svelte/store';
 import AboutModal from '../modals/AboutModal.svelte';
 import SqlGeneratorModal from '../modals/SqlGeneratorModal.svelte';
@@ -46,7 +46,7 @@ import { isProApp } from '../utility/proTools';
 import { openWebLink } from '../utility/simpleTools';
 import { _t } from '../translations';
 import ExportImportConnectionsModal from '../modals/ExportImportConnectionsModal.svelte';
-import { getBoolSettingsValue } from '../settings/settingsTools';
+import { getBoolSettingsValue, isAiDisabled } from '../settings/settingsTools';
 import { __t } from '../translations';
 
 // function themeCommand(theme: ThemeDefinition) {
@@ -753,7 +753,8 @@ if (isProApp()) {
     testEnabled: () =>
       getCurrentDatabase() != null &&
       findEngineDriver(getCurrentDatabase()?.connection, getExtensions())?.databaseEngineTypes?.includes('sql') &&
-      hasPermission('dbops/chat'),
+      hasPermission('dbops/chat') &&
+      !isAiDisabled(),
     onClick: () => {
       openNewTab({
         title: 'Chat',
@@ -776,7 +777,8 @@ if (isProApp()) {
     testEnabled: () =>
       getCurrentDatabase() != null &&
       findEngineDriver(getCurrentDatabase()?.connection, getExtensions())?.databaseEngineTypes?.includes('graphql') &&
-      hasPermission('dbops/chat'),
+      hasPermission('dbops/chat') &&
+      !isAiDisabled(),
     onClick: () => {
       openNewTab({
         title: 'GraphQL Chat',
@@ -902,16 +904,20 @@ export function registerFileCommands({
   fileExtension,
   save = true,
   execute = false,
+  executeUsageAnalytics = undefined as GlobalCommand['usageAnalytics'],
+  killUsageAnalytics = undefined as GlobalCommand['usageAnalytics'],
   toggleComment = false,
   findReplace = false,
   undoRedo = false,
   executeAdditionalCondition = null,
   copyPaste = false,
   defaultTeamFolder = false,
+  usageFeature = undefined as string,
 }) {
   if (save) {
     registerCommand({
       id: idPrefix + '.save',
+      usageFeature,
       group: 'save',
       category,
       name: __t('command.save', { defaultMessage: 'Save' }),
@@ -924,6 +930,7 @@ export function registerFileCommands({
     });
     registerCommand({
       id: idPrefix + '.saveAs',
+      usageFeature,
       group: 'saveAs',
       category,
       name: __t('command.saveAs', { defaultMessage: 'Save As' }),
@@ -932,6 +939,7 @@ export function registerFileCommands({
     });
     registerCommand({
       id: idPrefix + '.saveToDisk',
+      usageFeature,
       category,
       name: __t('command.saveToDisk', { defaultMessage: 'Save to disk' }),
       testEnabled: () => getCurrentEditor() != null && getElectron() != null,
@@ -942,6 +950,8 @@ export function registerFileCommands({
   if (execute) {
     registerCommand({
       id: idPrefix + '.execute',
+      usageFeature,
+      usageAnalytics: executeUsageAnalytics,
       category,
       name: __t('command.execute', { defaultMessage: 'Execute' }),
       icon: 'icon run',
@@ -956,6 +966,8 @@ export function registerFileCommands({
     });
     registerCommand({
       id: idPrefix + '.kill',
+      usageFeature,
+      usageAnalytics: killUsageAnalytics,
       category,
       name: __t('command.kill', { defaultMessage: 'Kill' }),
       icon: 'icon close',
@@ -969,6 +981,7 @@ export function registerFileCommands({
   if (toggleComment) {
     registerCommand({
       id: idPrefix + '.toggleComment',
+      usageFeature,
       category,
       name: __t('command.toggleComment', { defaultMessage: 'Toggle comment' }),
       keyText: 'CtrlOrCommand+/',
@@ -981,6 +994,7 @@ export function registerFileCommands({
   if (copyPaste) {
     registerCommand({
       id: idPrefix + '.copy',
+      usageFeature,
       category,
       name: __t('command.copy', { defaultMessage: 'Copy' }),
       disableHandleKeyText: 'CtrlOrCommand+C',
@@ -989,6 +1003,7 @@ export function registerFileCommands({
     });
     registerCommand({
       id: idPrefix + '.paste',
+      usageFeature,
       category,
       name: __t('command.paste', { defaultMessage: 'Paste' }),
       disableHandleKeyText: 'CtrlOrCommand+V',
@@ -1000,6 +1015,7 @@ export function registerFileCommands({
   if (findReplace) {
     registerCommand({
       id: idPrefix + '.find',
+      usageFeature,
       category,
       name: __t('command.find', { defaultMessage: 'Find' }),
       keyText: 'CtrlOrCommand+F',
@@ -1008,6 +1024,7 @@ export function registerFileCommands({
     });
     registerCommand({
       id: idPrefix + '.replace',
+      usageFeature,
       category,
       keyText: isMac() ? 'Alt+Command+F' : 'CtrlOrCommand+H',
       name: __t('command.replace', { defaultMessage: 'Replace' }),
@@ -1018,6 +1035,7 @@ export function registerFileCommands({
   if (undoRedo) {
     registerCommand({
       id: idPrefix + '.undo',
+      usageFeature,
       category,
       name: __t('command.undo', { defaultMessage: 'Undo' }),
       group: 'undo',
@@ -1027,6 +1045,7 @@ export function registerFileCommands({
     });
     registerCommand({
       id: idPrefix + '.redo',
+      usageFeature,
       category,
       group: 'redo',
       name: __t('command.redo', { defaultMessage: 'Redo' }),

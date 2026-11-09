@@ -101,8 +101,20 @@ function decryptObjectPasswordField(obj, field, encryptor = null) {
   return obj;
 }
 
-const fieldsToEncrypt = ['password', 'sshPassword', 'sshKeyfilePassword', 'connectionDefinition', 'httpProxyPassword'];
+const passwordModeControlledFieldsToEncrypt = [
+  'password',
+  'sshPassword',
+  'sshKeyfilePassword',
+  'connectionDefinition',
+  'httpProxyPassword',
+];
+const fieldsToAlwaysEncrypt = ['cloudflareApiToken'];
+const fieldsToEncrypt = [...passwordModeControlledFieldsToEncrypt, ...fieldsToAlwaysEncrypt];
 const additionalFieldsToMask = [
+  'accessToken',
+  'authToken',
+  'apiKeyValue',
+  'httpProxyUrl',
   'databaseUrl',
   'server',
   'port',
@@ -118,16 +130,23 @@ const additionalFieldsToMask = [
   'sslKeyFile',
   'sslRejectUnauthorized',
   'secretAccessKey',
+  'sessionToken',
   'accessKeyId',
   'endpoint',
   'endpointKey',
+  'cloudflareAccountId',
+  'cloudflareDatabaseId',
+  'cloudflareApiUrl',
 ];
 
 function encryptConnection(connection, encryptor = null) {
   if (connection.passwordMode != 'saveRaw') {
-    for (const field of fieldsToEncrypt) {
+    for (const field of passwordModeControlledFieldsToEncrypt) {
       connection = encryptObjectPasswordField(connection, field, encryptor);
     }
+  }
+  for (const field of fieldsToAlwaysEncrypt) {
+    connection = encryptObjectPasswordField(connection, field, encryptor);
   }
   return connection;
 }
@@ -137,9 +156,9 @@ function maskConnection(connection) {
   return _.omit(connection, [...fieldsToEncrypt, ...additionalFieldsToMask]);
 }
 
-function decryptConnection(connection) {
+function decryptConnection(connection, encryptor = null) {
   for (const field of fieldsToEncrypt) {
-    connection = decryptObjectPasswordField(connection, field);
+    connection = decryptObjectPasswordField(connection, field, encryptor);
   }
   return connection;
 }

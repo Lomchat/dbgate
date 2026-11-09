@@ -55,6 +55,7 @@
     $values.passwordMode != 'askUser';
   $: showPasswordMode = driver?.showConnectionField('password', $values, showConnectionFieldArgs);
   $: isConnected = $openedConnections.includes($values._id) || $openedSingleDatabaseConnections.includes($values._id);
+  $: showMcpEnabled = driver && !$config?.storageDatabase;
 
   const awsRegions = [
     'us-east-1',
@@ -166,6 +167,43 @@
       disabled={isConnected || isFormReadOnly || disabledFields.includes('databaseFile')}
     />
   {/if}
+{/if}
+
+{#if driver?.showConnectionField('cloudflareAccountId', $values, showConnectionFieldArgs)}
+  <FormTextField
+    label={_t('connection.cloudflareAccountId', { defaultMessage: 'Cloudflare Account ID' })}
+    name="cloudflareAccountId"
+    data-testid="ConnectionDriverFields_cloudflareAccountId"
+    disabled={isConnected || isFormReadOnly || disabledFields.includes('cloudflareAccountId')}
+  />
+{/if}
+
+{#if driver?.showConnectionField('cloudflareDatabaseId', $values, showConnectionFieldArgs)}
+  <FormTextField
+    label={_t('connection.cloudflareDatabaseId', { defaultMessage: 'D1 Database ID' })}
+    name="cloudflareDatabaseId"
+    data-testid="ConnectionDriverFields_cloudflareDatabaseId"
+    disabled={isConnected || isFormReadOnly || disabledFields.includes('cloudflareDatabaseId')}
+  />
+{/if}
+
+{#if driver?.showConnectionField('cloudflareApiToken', $values, showConnectionFieldArgs)}
+  <FormPasswordField
+    label={_t('connection.cloudflareApiToken', { defaultMessage: 'Cloudflare API Token' })}
+    name="cloudflareApiToken"
+    data-testid="ConnectionDriverFields_cloudflareApiToken"
+    disabled={isConnected || isFormReadOnly || disabledFields.includes('cloudflareApiToken')}
+  />
+{/if}
+
+{#if driver?.showConnectionField('cloudflareApiUrl', $values, showConnectionFieldArgs)}
+  <FormTextField
+    label={_t('connection.cloudflareApiUrl', { defaultMessage: 'Cloudflare API URL (optional)' })}
+    name="cloudflareApiUrl"
+    data-testid="ConnectionDriverFields_cloudflareApiUrl"
+    placeholder="https://api.cloudflare.com/client/v4"
+    disabled={isConnected || isFormReadOnly || disabledFields.includes('cloudflareApiUrl')}
+  />
 {/if}
 
 {#if driver?.showConnectionField('useDatabaseUrl', $values, showConnectionFieldArgs)}
@@ -488,12 +526,16 @@
     options={[
       { value: 'saveEncrypted', label: _t('connection.saveEncrypted', { defaultMessage: 'Save and encrypt' }) },
       { value: 'saveRaw', label: _t('connection.saveRaw', { defaultMessage: 'Save raw (UNSAFE!!)' }) },
-      { value: 'askPassword', label: _t('connection.askPassword', { defaultMessage: "Don't save, ask for password" }) },
-      {
+      // Team Premium shares connections through roles, so the password is always saved there
+      !$config?.storageDatabase && {
+        value: 'askPassword',
+        label: _t('connection.askPassword', { defaultMessage: "Don't save, ask for password" }),
+      },
+      !$config?.storageDatabase && {
         value: 'askUser',
         label: _t('connection.askUser', { defaultMessage: "Don't save, ask for login and password" }),
       },
-    ]}
+    ].filter(Boolean)}
     data-testid="ConnectionDriverFields_passwordMode"
   />
 {/if}
@@ -523,6 +565,15 @@
     name="isReadOnly"
     disabled={isConnected || isFormReadOnly}
     data-testid="ConnectionDriverFields_isReadOnly"
+  />
+{/if}
+
+{#if showMcpEnabled}
+  <FormCheckboxField
+    label={_t('connection.mcpEnabled', { defaultMessage: 'Available in MCP server' })}
+    name="mcpEnabled"
+    disabled={isConnected || isFormReadOnly}
+    data-testid="ConnectionDriverFields_mcpEnabled"
   />
 {/if}
 

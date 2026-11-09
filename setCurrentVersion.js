@@ -4,7 +4,16 @@ const path = require('path');
 function changeDependencies(deps, version) {
   if (!deps) return;
   for (const key of Object.keys(deps)) {
-    if (key.startsWith('dbgate-') && key != 'dbgate-plugin-tools' && key != 'dbgate-query-splitter') {
+    if (
+      key.startsWith('dbgate-') &&
+      key != 'dbgate-plugin-tools' &&
+      key != 'dbgate-query-splitter' &&
+      key != 'dbgate-pg-dumper' &&
+      key != 'dbgate-mssql-dumper' &&
+      key != 'dbgate-mysql-dumper' &&
+      key != 'dbgate-sqlite-dumper' &&
+      key != 'dbgate-redis-dumper'
+    ) {
       deps[key] = `${version}`;
     }
   }

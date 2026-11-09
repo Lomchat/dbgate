@@ -18,10 +18,24 @@ const url = require('url');
 const mainMenuDefinition = require('./mainMenuDefinition');
 const { isProApp } = require('./proTools');
 const updaterChannel = require('./updaterChannel');
+const flushAnalyticsOnClose = require('./flushAnalyticsOnClose');
+const { getErrorCategory } = require('./errorCategory');
 
 // require('@electron/remote/main').initialize();
 
 const configRootPath = path.join(app.getPath('userData'), 'config-root.json');
+// Crashes cannot be sent from a dying process, they are recorded here and reported by the
+// frontend when the window runs again. Only the action and the error category are stored.
+const crashReportsPath = path.join(app.getPath('userData'), 'crash-reports.json');
+const MAX_STORED_CRASH_REPORTS = 10;
+const RENDERER_GONE_CATEGORIES = {
+  oom: 'out_of_memory',
+  crashed: 'renderer_crashed',
+  killed: 'process_killed',
+  'launch-failed': 'launch_failed',
+  'integrity-failure': 'integrity_failure',
+  'abnormal-exit': 'abnormal_exit',
+};
 let saveConfigOnExit = true;
 let initialConfig = {};
 let apiLoaded = false;
@@ -41,8 +55,41 @@ function getTranslated(key) {
   return key;
 }
 
+function storeCrashReport(action, category) {
+  try {
+    let reports = [];
+    if (fs.existsSync(crashReportsPath)) {
+      const parsed = JSON.parse(fs.readFileSync(crashReportsPath, 'utf-8'));
+      if (Array.isArray(parsed)) reports = parsed;
+    }
+    reports.push({ action, param: category });
+    fs.writeFileSync(crashReportsPath, JSON.stringify(reports.slice(-MAX_STORED_CRASH_REPORTS)));
+  } catch (err) {
+    console.error('Error storing crash report', err);
+  }
+}
+
+function sendStoredCrashReports() {
+  try {
+    if (!fs.existsSync(crashReportsPath)) return;
+    const reports = JSON.parse(fs.readFileSync(crashReportsPath, 'utf-8'));
+    fs.unlinkSync(crashReportsPath);
+    for (const report of Array.isArray(reports) ? reports : []) {
+      mainWindow.webContents.send('report-crash', report);
+    }
+  } catch (err) {
+    console.error('Error sending crash reports', err);
+  }
+}
+
 process.on('uncaughtException', function (error) {
+  storeCrashReport('crash_backend', getErrorCategory(error));
   console.error('uncaughtException', error);
+});
+
+process.on('unhandledRejection', function (error) {
+  storeCrashReport('crash_backend', getErrorCategory(error));
+  console.error('unhandledRejection', error);
 });
 
 const isMac = () => os.platform() == 'darwin';
@@ -217,6 +264,8 @@ ipcMain.on('open-dev-tools', () => {
   mainWindow.webContents.openDevTools();
 });
 ipcMain.on('app-started', async (event, arg) => {
+  sendStoredCrashReports();
+
   if (runCommandOnLoad) {
     mainWindow.webContents.send('run-command', runCommandOnLoad);
     runCommandOnLoad = null;
@@ -297,12 +346,30 @@ ipcMain.on('window-action', async (event, arg) => {
   }
 });
 
+// Since Electron 43, dialogs default to the Downloads folder instead of the last used directory,
+// so the last used directory is tracked here to keep the previous behaviour
+let lastDialogDirectory = null;
+function withLastDialogDirectory(options) {
+  if (!lastDialogDirectory) return options;
+  if (!options?.defaultPath) return { ...options, defaultPath: lastDialogDirectory };
+  if (!path.isAbsolute(options.defaultPath)) {
+    return { ...options, defaultPath: path.join(lastDialogDirectory, options.defaultPath) };
+  }
+  return options;
+}
+
 ipcMain.handle('showOpenDialog', async (event, options) => {
-  const res = electron.dialog.showOpenDialogSync(mainWindow, options);
+  const res = electron.dialog.showOpenDialogSync(mainWindow, withLastDialogDirectory(options));
+  if (res && res.length > 0) {
+    lastDialogDirectory = options?.properties?.includes('openDirectory') ? res[0] : path.dirname(res[0]);
+  }
   return res;
 });
 ipcMain.handle('showSaveDialog', async (event, options) => {
-  const res = electron.dialog.showSaveDialogSync(mainWindow, options);
+  const res = electron.dialog.showSaveDialogSync(mainWindow, withLastDialogDirectory(options));
+  if (res) {
+    lastDialogDirectory = path.dirname(res);
+  }
   return res;
 });
 ipcMain.handle('showItemInFolder', async (event, path) => {
@@ -399,6 +466,24 @@ function createWindow() {
       spellcheck: false,
     },
   });
+
+  flushAnalyticsOnClose(mainWindow, app);
+
+  // The frontend cannot report that its own process died, so the reason is recorded here.
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    const reason = details?.reason;
+    if (reason == 'clean-exit') return;
+    storeCrashReport('crash', RENDERER_GONE_CATEGORIES[reason] || 'unknown');
+    console.error('render-process-gone', details);
+  });
+
+  mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
+    { urls: ['https://*.tile.openstreetmap.org/*'] },
+    (details, callback) => {
+      details.requestHeaders['Referer'] = 'https://www.dbgate.io';
+      callback({ requestHeaders: details.requestHeaders });
+    }
+  );
 
   if (initialConfig['winIsMaximized']) {
     mainWindow.maximize();

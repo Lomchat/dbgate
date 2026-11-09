@@ -4,7 +4,7 @@ const getExpressPath = require('../utility/getExpressPath');
 const { getLogger, extractErrorLogData } = require('dbgate-tools');
 const AD = require('activedirectory2').promiseWrapper;
 const crypto = require('crypto');
-const { getTokenSecret, getTokenLifetime } = require('../auth/authCommon');
+const { getTokenSecret, getTokenLifetime, isBasicAuthActive } = require('../auth/authCommon');
 const {
   getAuthProviderFromReq,
   getAuthProviders,
@@ -28,10 +28,17 @@ const {
   markUserAsActive,
   markLoginAsLoggedOut,
 } = require('../utility/loginchecker');
+const {
+  readMcpConfig,
+  getPublicBaseUrl,
+  getMcpResourceUrl,
+  setMcpIdentity,
+  safeTokenHashEquals,
+} = require('../utility/mcpAuth');
 
 const logger = getLogger('auth');
 
-function unauthorizedResponse(req, res, text) {
+function unauthorizedResponse(req, res, text, mcpAuthMode = null) {
   // if (req.path == getExpressPath('/config/get-settings')) {
   //   return res.json({});
   // }
@@ -39,15 +46,74 @@ function unauthorizedResponse(req, res, text) {
   //   return res.json([]);
   // }
 
+  if (req.path == getExpressPath('/mcp')) {
+    res.setHeader(
+      'WWW-Authenticate',
+      mcpAuthMode == 'oauth'
+        ? `Bearer resource_metadata="${getPublicBaseUrl(req)}${getExpressPath('/.well-known/oauth-protected-resource')}"`
+        : 'Bearer'
+    );
+  }
+
   return res.status(401).send(text);
 }
 
-function authMiddleware(req, res, next) {
+async function authenticateMcpRequest(req, res, next) {
+  const config = await readMcpConfig();
+  if (!config.enabled) {
+    return res.status(403).send('DBGM-00245 MCP server is disabled');
+  }
+
+  if (config.authMode == 'none') {
+    setMcpIdentity(req);
+    return next();
+  }
+
+  const authHeader = req.headers.authorization;
+  const [scheme, token] = authHeader?.split(' ') ?? [];
+  if (scheme != 'Bearer' || !token) {
+    return unauthorizedResponse(req, res, 'missing or invalid MCP authorization header', config.authMode);
+  }
+
+  if (config.authMode == 'token') {
+    if (!safeTokenHashEquals(token, config.tokenHash)) {
+      return unauthorizedResponse(req, res, 'invalid MCP token', config.authMode);
+    }
+    setMcpIdentity(req, { licenseUid: 'mcp-token', login: 'mcp-token' });
+    return next();
+  }
+
+  try {
+    const decoded = jwt.verify(token, getTokenSecret());
+    if (
+      decoded.tokenUse != 'mcp' ||
+      decoded.aud != getMcpResourceUrl(req) ||
+      decoded.oauthClientId != config.oauthClientId
+    ) {
+      throw new Error('Invalid MCP token claims');
+    }
+    setMcpIdentity(req, decoded);
+    markUserAsActive(decoded.licenseUid, token);
+    return next();
+  } catch (err) {
+    return unauthorizedResponse(req, res, 'invalid MCP OAuth token', config.authMode);
+  }
+}
+
+async function authMiddleware(req, res, next) {
+  if (req.path == getExpressPath('/mcp')) {
+    try {
+      return await authenticateMcpRequest(req, res, next);
+    } catch (err) {
+      logger.error(extractErrorLogData(err), 'DBGM-00246 Error loading MCP authentication configuration');
+      return res.status(500).send('DBGM-00247 Could not load MCP authentication configuration');
+    }
+  }
+
   const SKIP_AUTH_PATHS = [
     '/config/get',
     '/config/logout',
     '/config/get-settings',
-    '/config/save-license-key',
     '/auth/oauth-token',
     '/auth/login',
     '/auth/redirect',
@@ -58,8 +124,15 @@ function authMiddleware(req, res, next) {
     '/storage/request-password-reset',
     '/storage/reset-password',
     '/auth/get-providers',
+    '/.well-known/oauth-protected-resource',
+    '/.well-known/oauth-protected-resource/mcp',
+    '/.well-known/oauth-authorization-server',
+    '/.well-known/openid-configuration',
+    '/authorize',
+    '/token',
+    '/mcp/oauth/authorize',
+    '/mcp/oauth/token',
     '/connections/dblogin-web',
-    '/connections/dblogin-app',
     '/connections/dblogin-auth',
     '/connections/dblogin-auth-token',
     '/health',
@@ -75,7 +148,7 @@ function authMiddleware(req, res, next) {
     return next();
   }
 
-  if (process.env.BASIC_AUTH) {
+  if (isBasicAuthActive()) {
     // API is not authorized for basic auth
     return next();
   }
@@ -92,6 +165,12 @@ function authMiddleware(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, getTokenSecret());
+    // Session tokens never carry tokenUse. Anything that does was minted for a narrower
+    // purpose (the MCP server, an autoExecute team file, ...) and must not be accepted here
+    // as proof of an API session.
+    if (decoded.tokenUse) {
+      throw new Error(`Token issued for ${decoded.tokenUse} cannot be used for the DbGate API`);
+    }
     req.user = decoded;
     markUserAsActive(decoded.licenseUid, token);
 
@@ -109,11 +188,13 @@ function authMiddleware(req, res, next) {
 }
 
 module.exports = {
+  oauthToken_access: 'public',
   oauthToken_meta: true,
   async oauthToken(params, req) {
     const { amoid } = params;
     return getAuthProviderById(amoid).oauthToken(params, req);
   },
+  login_access: 'public',
   login_meta: true,
   async login(params, req) {
     const { amoid, login, password, isAdminPage } = params;
@@ -170,8 +251,14 @@ module.exports = {
       return { error: 'Login failed' };
     }
 
-    return getAuthProviderById(amoid).login(login, password, undefined, req);
+    const authProvider = getAuthProviderById(amoid);
+    if (!authProvider) {
+      return { error: 'Login failed' };
+    }
+    return authProvider.login(login, password, undefined, req);
   },
+
+  getProviders_access: 'public',
 
   getProviders_meta: true,
   getProviders() {
@@ -183,22 +270,32 @@ module.exports = {
     };
   },
 
+  redirect_access: 'public',
+
   redirect_meta: true,
   async redirect(params) {
     const { amoid } = params;
     return getAuthProviderById(amoid).redirect(params);
   },
 
+  createCloudLoginSession_access: { permission: 'widgets/cloud-private', privateCloud: true },
+
   createCloudLoginSession_meta: true,
-  async createCloudLoginSession({ client, redirectUri }) {
+  async createCloudLoginSession({ client, redirectUri }, req) {
+    // The token goes only to the browser tab that started the login - /stream is not
+    // authenticated, so a broadcast would hand it to anyone connected. Without a stream id
+    // (the desktop app) only the Electron window receives it.
+    const strmid = socket.getStrmidFromRequest(req) ?? (req ? '__no_stream__' : undefined);
     const res = await createDbGateIdentitySession(client, redirectUri);
     startCloudTokenChecking(res.sid, tokenHolder => {
-      socket.emit('got-cloud-token', tokenHolder);
+      socket.emit('got-cloud-token', strmid ? { ...tokenHolder, strmid } : tokenHolder);
       socket.emitChanged('cloud-content-changed');
       socket.emit('cloud-content-updated');
     });
     return res;
   },
+
+  cloudLoginRedirected_access: { permission: 'widgets/cloud-private', privateCloud: true },
 
   cloudLoginRedirected_meta: true,
   async cloudLoginRedirected({ sid }) {
@@ -206,17 +303,31 @@ module.exports = {
     return tokenHolder;
   },
 
+  cloudTestLogin_access: 'self',
+
   cloudTestLogin_meta: true,
   async cloudTestLogin({ email }) {
+    // signs the server into DbGate Cloud as a test account - only for the e2e tests and development
+    if (!require('../utility/processArgs').runE2eTests && !process.env.DEVMODE) {
+      throw new Error('DBGM-00000 Cloud test login is available only in tests');
+    }
     const tokenHolder = await readCloudTestTokenHolder(email);
     return tokenHolder;
   },
 
+  logoutAdmin_access: 'self',
+
   logoutAdmin_meta: true,
-  async logoutAdmin() {
+  async logoutAdmin(_params, req) {
+    // frees the licensed administrator login - only the administrator's own session may do that
+    if (req && req.user?.amoid != 'superadmin' && req.user?.licenseUid != 'superadmin') {
+      return true;
+    }
     await markLoginAsLoggedOut('superadmin');
     return true;
   },
+
+  logoutUser_access: 'user',
 
   logoutUser_meta: true,
   async logoutUser({}, req) {

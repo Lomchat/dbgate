@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const _ = require('lodash');
 const path = require('path');
 const fs = require('fs-extra');
-const byline = require('byline');
+const { createLineStream } = require('../utility/lineStream');
 const socket = require('../utility/socket');
 const { fork, spawn } = require('child_process');
 const { rundir, uploadsdir, pluginsdir, getPluginBackendPath, packagedPluginList } = require('../utility/directories');
@@ -10,6 +10,7 @@ const {
   extractShellApiPlugins,
   compileShellApiFunctionName,
   jsonScriptToJavascript,
+  assertValidShellApiFunctionName,
   getLogger,
   safeJsonParse,
   pinoLogRecordToMessageRecord,
@@ -19,13 +20,22 @@ const {
 const { handleProcessCommunication } = require('../utility/processComm');
 const processArgs = require('../utility/processArgs');
 const platformInfo = require('../utility/platformInfo');
-const { checkSecureDirectories, checkSecureDirectoriesInScript } = require('../utility/security');
+const config = require('./config');
+const { checkSecureDirectories, isValidRunId } = require('../utility/security');
+const { checkJsonScriptAccess, checkShellFunctionCall } = require('../utility/jsonScriptAccess');
 const { sendToAuditLog, logJsonRunnerScript } = require('../utility/auditlog');
 const { testStandardPermission } = require('../utility/hasPermission');
 const logger = getLogger('runners');
 
 function extractPlugins(script) {
-  const requireRegex = /\s*\/\/\s*@require\s+([^\s]+)\s*\n/g;
+  // Anchored to a true line start so a directive can only ever come from a comment line the
+  // generator itself emitted, not from user-controlled text that merely contains the substring
+  // "// @require ..." elsewhere on a line. Uses the zero-width multiline '^' rather than an
+  // "(?:^|\n)" alternation - the latter consumes the previous line's '\n' as part of its match,
+  // so with several directives on consecutive lines, matching resumes mid-line and every other
+  // directive is skipped. '\r?' tolerates CRLF line endings. '\uFEFF?' tolerates a leading
+  // BOM in hand-authored scripts.
+  const requireRegex = /^\uFEFF?[ \t]*\/\/[ \t]*@require[ \t]+(\S+)[ \t]*\r?\n/gm;
   const matches = [...script.matchAll(requireRegex)];
   return matches.map(x => x[1]);
 }
@@ -54,19 +64,26 @@ logger.info('DBGM-00014 Finished job script');
 dbgateApi.runScript(run);
 `;
 
-const loaderScriptTemplate = (prefix, functionName, props, runid) => `
+const loaderScriptTemplate = (functionName, props, runid) => {
+  const plugins = extractShellApiPlugins(functionName, props);
+  const prefix = plugins.map(packageName => `// @require ${packageName}\n`).join('');
+  return `
 ${prefix}
 const dbgateApi = require(process.env.DBGATE_API);
 dbgateApi.initializeApiEnvironment();
-${requirePluginsTemplate(extractShellApiPlugins(functionName, props))}
+${requirePluginsTemplate(plugins)}
 require=null;
 async function run() {
 const reader=await ${compileShellApiFunctionName(functionName)}(${JSON.stringify(props)});
-const writer=await dbgateApi.collectorWriter({runid: '${runid}'});
+const writer=await dbgateApi.collectorWriter({runid: ${JSON.stringify(runid)}});
 await dbgateApi.copyStream(reader, writer);
 }
 dbgateApi.runScript(run);
 `;
+};
+
+// a stream id no browser tab has - events of runs started only to return their result go nowhere
+const INTERNAL_RUN_STREAM = '__internal_run__';
 
 module.exports = {
   /** @type {import('dbgate-types').OpenedRunner[]} */
@@ -94,7 +111,7 @@ module.exports = {
         toEmit.severity = 'error';
       }
 
-      socket.emit(`runner-info-${runid}`, toEmit);
+      socket.emitOwned(socket.runnerOwnerKey(runid), `runner-info-${runid}`, toEmit);
     }
   },
 
@@ -115,7 +132,7 @@ module.exports = {
   },
 
   handle_progress(runid, progressData) {
-    socket.emit(`runner-progress-${runid}`, progressData);
+    socket.emitOwned(socket.runnerOwnerKey(runid), `runner-progress-${runid}`, progressData);
   },
 
   rejectRequest(runid, error) {
@@ -126,7 +143,8 @@ module.exports = {
     }
   },
 
-  startCore(runid, scriptText) {
+  async startCore(runid, scriptText) {
+    const settings = await config.getSettings();
     const directory = path.join(rundir(), runid);
     const scriptFile = path.join(uploadsdir(), runid + '.js');
     fs.writeFileSync(`${scriptFile}`, scriptText);
@@ -150,6 +168,7 @@ module.exports = {
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         env: {
           ...process.env,
+          NODE_NO_WARNINGS: settings?.['behaviour.useDiagnosticTools'] === true ? '0' : '1',
           DBGATE_API: global['API_PACKAGE'] || process.argv[1],
           ..._.fromPairs(pluginNames.map(name => [`PLUGIN_${_.camelCase(name)}`, getPluginBackendPath(name)])),
         },
@@ -168,13 +187,13 @@ module.exports = {
       }
     };
 
-    byline(subprocess.stdout).on('data', pipeDispatcher('info'));
-    byline(subprocess.stderr).on('data', pipeDispatcher('error'));
+    createLineStream(subprocess.stdout).on('data', pipeDispatcher('info'));
+    createLineStream(subprocess.stderr).on('data', pipeDispatcher('error'));
     subprocess.on('exit', code => {
       // console.log('... EXITED', code);
       this.rejectRequest(runid, { message: 'DBGM-00281 No data returned, maybe input data source is too big' });
       logger.info({ code, pid: subprocess.pid }, 'DBGM-00016 Exited process');
-      socket.emit(`runner-done-${runid}`, code);
+      socket.emitOwned(socket.runnerOwnerKey(runid), `runner-done-${runid}`, code);
       this.opened = this.opened.filter(x => x.runid != runid);
     });
     subprocess.on('error', error => {
@@ -196,6 +215,27 @@ module.exports = {
       // @ts-ignore
       const { msgtype } = message;
       if (handleProcessCommunication(message, subprocess)) return;
+      if (msgtype === 'get-volatile-connection') {
+        const connections = require('./connections');
+        // @ts-ignore
+        const conid = message.conid;
+        if (!conid || typeof conid !== 'string') return;
+        const trySend = payload => {
+          if (!subprocess.connected) return;
+          try {
+            subprocess.send(payload);
+          } catch {
+            // child disconnected between the check and the send — ignore
+          }
+        };
+        connections.getCore({ conid }).then(conn => {
+          trySend({ msgtype: 'volatile-connection-response', conid, conn: conn?.unsaved ? conn : null });
+        }).catch(err => {
+          logger.error({ ...extractErrorLogData(err), conid }, 'DBGM-00337 Error resolving volatile connection for child process');
+          trySend({ msgtype: 'volatile-connection-response', conid, conn: null });
+        });
+        return;
+      }
       this[`handle_${msgtype}`](runid, message);
     });
     return _.pick(newOpened, ['runid']);
@@ -218,19 +258,29 @@ module.exports = {
     };
 
     const subprocess = spawn(command, args, { env: { ...process.env, ...env } });
+    let finished = false;
 
-    byline(subprocess.stdout).on('data', pipeDispatcher('info'));
-    byline(subprocess.stderr).on('data', pipeDispatcher('error'));
+    const finish = code => {
+      if (finished) return;
+      finished = true;
+      socket.emitOwned(socket.runnerOwnerKey(runid), `runner-done-${runid}`, code);
+      if (onFinished) {
+        Promise.resolve(onFinished()).catch(error => {
+          logger.error(extractErrorLogData(error), 'DBGM-00338 Error finalizing external process');
+        });
+      }
+      this.opened = this.opened.filter(x => x.runid != runid);
+    };
 
-    subprocess.on('exit', code => {
+    createLineStream(subprocess.stdout).on('data', pipeDispatcher('info'));
+    createLineStream(subprocess.stderr).on('data', pipeDispatcher('error'));
+
+    // Wait for stdio to close so all process output is dispatched before the final status.
+    subprocess.on('close', code => {
       console.log('... EXITED', code);
       logger.info({ code, pid: subprocess.pid }, 'DBGM-00017 Exited process');
       this.dispatchMessage(runid, `DBGM-00282 Finished external process with code ${code}`);
-      socket.emit(`runner-done-${runid}`, code);
-      if (onFinished) {
-        onFinished();
-      }
-      this.opened = this.opened.filter(x => x.runid != runid);
+      finish(code);
     });
     subprocess.on('spawn', () => {
       this.dispatchMessage(runid, `DBGM-00283 Started external process ${command}`);
@@ -247,8 +297,7 @@ module.exports = {
           message: `Command ${command} not found, please install it and configure its location in DbGate settings, Settings/External tools, if ${command} is not in system PATH`,
         });
       }
-      socket.emit(`runner-done-${runid}`);
-      this.opened = this.opened.filter(x => x.runid != runid);
+      finish(1);
     });
 
     if (stdinFilePath) {
@@ -272,15 +321,69 @@ module.exports = {
     return _.pick(newOpened, ['runid']);
   },
 
+  promiseRunCore(runid, callback, onFinished, operation = 'operation') {
+    const abortController = new AbortController();
+    const outputDirectory = path.join(rundir(), runid);
+    const newOpened = {
+      runid,
+      cancel: () => abortController.abort(),
+    };
+    this.opened.push(newOpened);
+
+    this.dispatchMessage(runid, `DBGM-00339 Started internal ${operation} process`);
+
+    Promise.resolve()
+      .then(() => fs.ensureDir(outputDirectory))
+      .then(() =>
+        callback({
+          signal: abortController.signal,
+          info: message => this.dispatchMessage(runid, message),
+          writeFile: async (name, data) => {
+            const safeName = path.basename(name);
+            if (!safeName || safeName !== name) {
+              throw new Error('DBGM-00000 Invalid runner output file name');
+            }
+            await fs.writeFile(path.join(outputDirectory, safeName), data);
+          },
+        })
+      )
+      .then(() => {
+        this.dispatchMessage(runid, `DBGM-00340 Finished internal ${operation} process`);
+        socket.emitOwned(socket.runnerOwnerKey(runid), `runner-done-${runid}`, { status: 'finished', exitCode: 0 });
+      })
+      .catch(error => {
+        const cancelled = abortController.signal.aborted;
+        this.dispatchMessage(runid, {
+          severity: cancelled ? 'info' : 'error',
+          message: extractErrorMessage(error),
+        });
+        socket.emitOwned(socket.runnerOwnerKey(runid), `runner-done-${runid}`, {
+          status: cancelled ? 'cancelled' : 'failed',
+          exitCode: cancelled ? null : 1,
+        });
+      })
+      .finally(() => {
+        if (onFinished) {
+          onFinished();
+        }
+        this.opened = this.opened.filter(x => x.runid != runid);
+      });
+
+    return _.pick(newOpened, ['runid']);
+  },
+
+  start_access: 'self',
+
   start_meta: true,
   async start({ script }, req) {
     const runid = crypto.randomUUID();
+    // script output and progress go to the browser tab that started it (socket.emitOwned)
+    socket.setOwner(socket.runnerOwnerKey(runid), socket.getStrmidFromRequest(req));
 
     if (script.type == 'json') {
       if (!platformInfo.isElectron) {
-        if (!checkSecureDirectoriesInScript(script)) {
-          return { errorMessage: 'DBGM-00284 Unallowed directories in script' };
-        }
+        // allowed functions, directories and the permissions for every connection it uses
+        await checkJsonScriptAccess(script, req);
       }
 
       logJsonRunnerScript(req, script);
@@ -318,10 +421,14 @@ module.exports = {
     return this.startCore(runid, scriptTemplate(script, false));
   },
 
+  getNodeScript_access: 'user',
+
   getNodeScript_meta: true,
   async getNodeScript({ script }) {
     return scriptTemplate(script, true);
   },
+
+  cancel_access: 'user',
 
   cancel_meta: true,
   async cancel({ runid }) {
@@ -329,12 +436,22 @@ module.exports = {
     if (!runner) {
       throw new Error('DBGM-00288 Invalid runner');
     }
-    runner.subprocess.kill();
+    if (runner.subprocess) {
+      runner.subprocess.kill();
+    } else if (runner.cancel) {
+      await runner.cancel();
+    }
     return { state: 'ok' };
   },
 
+  files_access: 'self',
+
   files_meta: true,
   async files({ runid }) {
+    // runid is a directory name under rundir() - '../..' would list any directory
+    if (!isValidRunId(runid)) {
+      throw new Error('DBGM-00000 Invalid runid');
+    }
     const directory = path.join(rundir(), runid);
     const files = await fs.readdir(directory);
     const res = [];
@@ -349,33 +466,45 @@ module.exports = {
     return res;
   },
 
+  loadReader_access: 'self',
+
   loadReader_meta: true,
-  async loadReader({ functionName, props }) {
+  async loadReader({ functionName, props }, req) {
     if (!platformInfo.isElectron) {
       if (props?.fileName && !checkSecureDirectories(props.fileName)) {
         return { errorMessage: 'DBGM-00289 Unallowed file' };
       }
+      await checkShellFunctionCall(functionName, props, req);
     }
-    const prefix = extractShellApiPlugins(functionName)
-      .map(packageName => `// @require ${packageName}\n`)
-      .join('');
 
     const promise = new Promise((resolve, reject) => {
+      assertValidShellApiFunctionName(functionName);
       const runid = crypto.randomUUID();
+      // the result is returned by this call; nobody listens to the runner's events
+      socket.setOwner(socket.runnerOwnerKey(runid), INTERNAL_RUN_STREAM);
       this.requests[runid] = { resolve, reject, exitOnStreamError: true };
-      this.startCore(runid, loaderScriptTemplate(prefix, functionName, props, runid));
+      this.startCore(runid, loaderScriptTemplate(functionName, props, runid)).catch(error =>
+        this.rejectRequest(runid, error)
+      );
     });
     return promise;
   },
 
+  scriptResult_access: 'self',
+
   scriptResult_meta: true,
-  async scriptResult({ script }) {
+  async scriptResult({ script }, req) {
     if (script.type != 'json') {
       return { errorMessage: 'DBGM-00290 Only JSON scripts are allowed' };
+    }
+    if (!platformInfo.isElectron) {
+      await checkJsonScriptAccess(script, req);
     }
 
     const promise = new Promise(async (resolve, reject) => {
       const runid = crypto.randomUUID();
+      // the result is returned by this call; nobody listens to the runner's events
+      socket.setOwner(socket.runnerOwnerKey(runid), INTERNAL_RUN_STREAM);
       this.requests[runid] = { resolve, reject, exitOnStreamError: true };
       const cloned = _.cloneDeepWith(script, node => {
         if (node?.$replace == 'runid') {
@@ -383,7 +512,7 @@ module.exports = {
         }
       });
       const js = await jsonScriptToJavascript(cloned);
-      this.startCore(runid, scriptTemplate(js, false));
+      this.startCore(runid, scriptTemplate(js, false)).catch(error => this.rejectRequest(runid, error));
     });
     return promise;
   },

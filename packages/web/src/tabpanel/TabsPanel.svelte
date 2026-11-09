@@ -334,11 +334,11 @@
   import newQuery from '../query/newQuery';
   import appObjectTypes from '../appobj';
 
-  import { currentDatabase, activeTabId, lockedDatabaseMode, draggingDbGroup, draggingDbGroupTarget, draggingTab, draggingTabTarget } from '../stores';
+  import { currentDatabase, activeTabId, lockedDatabaseMode, draggingDbGroup, draggingDbGroupTarget, draggingTab, draggingTabTarget, tabGroupShowServerName } from '../stores';
   import tabs from '../tabs';
   import { switchCurrentDatabase } from '../utility/common';
   import contextMenu from '../utility/contextMenu';
-  import { getConnectionInfo, useConnectionList, useSettings } from '../utility/metadataLoaders';
+  import { getConnectionInfo, useConnectionList } from '../utility/metadataLoaders';
   import { duplicateTab, getTabDbKey, sortTabs, groupTabs } from '../utility/openNewTab';
   import { useConnectionColorFactory } from '../utility/useConnectionColor';
   import TabCloseButton from '../elements/TabCloseButton.svelte';
@@ -380,8 +380,6 @@
   $: filteredTabsFromAllParts = $openedTabs.filter(x => shouldShowTab(x, $lockedDatabaseMode, $currentDatabase));
   $: allowSplitTab =
     _.uniq(filteredTabsFromAllParts.map(x => x.multiTabIndex || 0)).length == 1 && filteredTabsFromAllParts.length >= 2;
-
-  $: settings = useSettings();
 
   const connectionColorFactory = useConnectionColorFactory('background', 'background: ');
 
@@ -454,7 +452,7 @@
           { divider: true },
           {
             text: _t('tabsPanel.addToFavorites', { defaultMessage: 'Add to favorites' }),
-            onClick: () => showModal(FavoriteModal, { savingTab: tab }),
+            onClick: () => showModal(FavoriteModal, { savingTab: tab, source: 'tab_menu' }),
           },
         ],
       tabComponent &&
@@ -628,7 +626,7 @@
             }}
           >
             <div class="db-name-inner">
-              {#if $settings?.['tabGroup.showServerName'] && tabGroup.tabDbServer}
+              {#if $tabGroupShowServerName && tabGroup.tabDbServer}
                 <FontIcon icon="icon server" />
                 {tabGroup.tabDbServer}
               {/if}
@@ -833,6 +831,14 @@
     align-items: center;
     cursor: pointer;
     user-select: none;
+    transition:
+      background-color var(--dim-transition-fast),
+      color var(--dim-transition-fast);
+  }
+  .file-tab-item:not(.selected):hover,
+  .db-name:not(.selected):hover {
+    background-color: var(--theme-tabs-panel-item-background-hover);
+    color: var(--theme-tabs-panel-active-foreground);
   }
   .file-tab-item.selected {
     background-color: var(--theme-tabs-panel-active-background);

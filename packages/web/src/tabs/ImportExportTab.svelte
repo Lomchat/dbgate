@@ -20,6 +20,7 @@
 </script>
 
 <script lang="ts">
+  import { trackUsage } from '../utility/usageAnalytics';
   import moment from 'moment';
   import { writable } from 'svelte/store';
   import HorizontalSplitter from '../elements/HorizontalSplitter.svelte';
@@ -40,6 +41,7 @@
     selectedWidget,
     activeTabId,
   } from '../stores';
+  import { useConnectionInfo } from '../utility/metadataLoaders';
   import { apiCall, apiOff, apiOn } from '../utility/api';
   import createRef from '../utility/createRef';
   import openNewTab from '../utility/openNewTab';
@@ -54,7 +56,7 @@
   import _ from 'lodash';
   import createActivator from '../utility/createActivator';  import ToolStripCommandButton from '../buttons/ToolStripCommandButton.svelte';
   import ToolStripSaveButton from '../buttons/ToolStripSaveButton.svelte';
-  import uuidv1 from 'uuid/v1';
+  import { v1 as uuidv1 } from 'uuid';
   import { tick } from 'svelte';
   import { showSnackbarError } from '../utility/snackbar';
   import { _t } from '../translations';  let busy = false;
@@ -117,6 +119,13 @@
 
   // $: console.log('formValues', $formValues);
 
+  // Import/export always has at most one database side; its engine describes the operation.
+  $: usageConid =
+    $formValues?.sourceStorageType == 'database' ? $formValues?.sourceConnectionId : $formValues?.targetConnectionId;
+  $: usageConnection = useConnectionInfo({ conid: usageConid });
+  /** Direction and format of the transfer, e.g. database:csv or excel:database. */
+  $: usageParam = `${$formValues?.sourceStorageType}:${$formValues?.targetStorageType}`;
+
   $: setEditorData($formValues);
 
   $: updateTabTitle($formValues);
@@ -172,6 +181,13 @@
   };
 
   const handleGenerateScript = async e => {
+    trackUsage({
+      feature: 'import_export',
+      action: 'generate_script',
+      tab: 'import_export',
+      engine: $usageConnection?.engine,
+      param: usageParam,
+    });
     const values = $formValues as any;
     const code = await createImpExpScript($extensions, values, 'script', false);
     openNewTab(
@@ -186,6 +202,13 @@
 
   const handleExecute = async e => {
     if (busy) return;
+    trackUsage({
+      feature: 'import_export',
+      action: 'execute',
+      tab: 'import_export',
+      engine: $usageConnection?.engine,
+      param: usageParam,
+    });
     progressHolder = {};
     const values = $formValues as any;
     busy = true;
@@ -221,6 +244,13 @@
   };
 
   const handleCancel = () => {
+    trackUsage({
+      feature: 'import_export',
+      action: 'cancel',
+      tab: 'import_export',
+      engine: $usageConnection?.engine,
+      param: usageParam,
+    });
     apiCall('runners/cancel', {
       runid: runnerId,
     });

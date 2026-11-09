@@ -2,7 +2,13 @@ const fs = require('fs-extra');
 const readline = require('readline');
 const crypto = require('crypto');
 const path = require('path');
-const { archivedir, clearArchiveLinksCache, resolveArchiveFolder, uploadsdir } = require('../utility/directories');
+const {
+  archivedir,
+  clearArchiveLinksCache,
+  resolveArchiveFolder,
+  isArchiveLink,
+  uploadsdir,
+} = require('../utility/directories');
 const socket = require('../utility/socket');
 const loadFilesRecursive = require('../utility/loadFilesRecursive');
 const getJslFileName = require('../utility/getJslFileName');
@@ -10,6 +16,8 @@ const { getLogger, extractErrorLogData, jsonLinesParse } = require('dbgate-tools
 const dbgateApi = require('../shell');
 const jsldata = require('./jsldata');
 const platformInfo = require('../utility/platformInfo');
+const { testStandardPermission } = require('../utility/hasPermission');
+const { checkUploadedFilePath, copyExportFile } = require('../utility/security');
 const { isProApp } = require('../utility/checkLicense');
 const listZipEntries = require('../utility/listZipEntries');
 const unzipJsonLinesFile = require('../shell/unzipJsonLinesFile');
@@ -19,7 +27,28 @@ const unzipDirectory = require('../shell/unzipDirectory');
 
 const logger = getLogger('archive');
 
+/**
+ * Rejects any archive name (folder or file) that contains path-traversal
+ * sequences, directory separators, or null bytes. These values are used
+ * directly in path.join() calls; allowing traversal would let callers read
+ * or write arbitrary files outside the archive directory.
+ */
+function assertSafeArchiveName(name, label) {
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new Error(`DBGM-00103 Invalid ${label}: must be a non-empty string`);
+  }
+  if (name.includes('\0') || name.includes('..') || name.includes('/') || name.includes('\\')) {
+    throw new Error(`DBGM-00242 Invalid ${label}: path traversal not allowed`);
+  }
+  // Reject names that resolve to the archive root itself (e.g. '.')
+  const resolved = path.resolve(archivedir(), name);
+  if (resolved === path.resolve(archivedir())) {
+    throw new Error(`DBGM-00243 Invalid ${label}: must not resolve to the archive root`);
+  }
+}
+
 module.exports = {
+  folders_access: 'user',
   folders_meta: true,
   async folders() {
     const folders = await fs.readdir(archivedir());
@@ -30,6 +59,8 @@ module.exports = {
       },
       ...folders
         .filter(x => x != 'default')
+        // links are not followed outside the desktop app (resolveArchiveFolder)
+        .filter(x => platformInfo.isElectron || !isArchiveLink(x))
         .map(name => ({
           name,
           type: 'jsonl',
@@ -37,17 +68,32 @@ module.exports = {
     ];
   },
 
+  createFolder_access: 'self',
+
   createFolder_meta: true,
-  async createFolder({ folder }) {
+  async createFolder({ folder }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
     await fs.mkdir(path.join(archivedir(), folder));
     socket.emitChanged('archive-folders-changed');
     return true;
   },
 
+  createLink_access: 'electron',
+
   createLink_meta: true,
-  async createLink({ linkedFolder }) {
+  async createLink({ linkedFolder }, req) {
+    await testStandardPermission('archive/write', req);
+    // see resolveArchiveFolder - a link gives access to any folder it names
+    if (!platformInfo.isElectron) {
+      throw new Error('DBGM-00000 Archive folder links are supported only in the desktop app');
+    }
+    if ( typeof linkedFolder !== 'string' || linkedFolder.length === 0) {
+      throw new Error(`DBGM-00244 Invalid linkedFolder: must be a non-empty string`);
+    }
+    assertSafeArchiveName(path.parse(linkedFolder).name, 'linkedFolder');
     const folder = await this.getNewArchiveFolder({ database: path.parse(linkedFolder).name + '.link' });
-    fs.writeFile(path.join(archivedir(), folder), linkedFolder);
+    await fs.writeFile(path.join(archivedir(), folder), linkedFolder);
     clearArchiveLinksCache();
     socket.emitChanged('archive-folders-changed');
     return folder;
@@ -69,8 +115,12 @@ module.exports = {
     return files;
   },
 
+  files_access: 'user',
+
   files_meta: true,
   async files({ folder }) {
+    if (!folder) return [];
+    assertSafeArchiveName(folder, 'folder');
     try {
       if (folder.endsWith('.zip')) {
         if (await fs.exists(path.join(archivedir(), folder))) {
@@ -107,11 +157,15 @@ module.exports = {
     }
   },
 
+  refreshFiles_access: 'user',
+
   refreshFiles_meta: true,
   async refreshFiles({ folder }) {
     socket.emitChanged('archive-files-changed', { folder });
     return true;
   },
+
+  refreshFolders_access: 'user',
 
   refreshFolders_meta: true,
   async refreshFolders() {
@@ -119,8 +173,14 @@ module.exports = {
     return true;
   },
 
+  createFile_access: 'self',
+
   createFile_meta: true,
-  async createFile({ folder, file, fileType, tableInfo }) {
+  async createFile({ folder, file, fileType, tableInfo }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
+    assertSafeArchiveName(fileType, 'fileType');
     await fs.writeFile(
       path.join(resolveArchiveFolder(folder), `${file}.${fileType}`),
       tableInfo ? JSON.stringify({ __isStreamHeader: true, tableInfo }) : ''
@@ -129,15 +189,28 @@ module.exports = {
     return true;
   },
 
+  deleteFile_access: 'self',
+
   deleteFile_meta: true,
-  async deleteFile({ folder, file, fileType }) {
+  async deleteFile({ folder, file, fileType }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
+    assertSafeArchiveName(fileType, 'fileType');
     await fs.unlink(path.join(resolveArchiveFolder(folder), `${file}.${fileType}`));
     socket.emitChanged(`archive-files-changed`, { folder });
     return true;
   },
 
+  renameFile_access: 'self',
+
   renameFile_meta: true,
-  async renameFile({ folder, file, newFile, fileType }) {
+  async renameFile({ folder, file, newFile, fileType }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
+    assertSafeArchiveName(newFile, 'newFile');
+    assertSafeArchiveName(fileType, 'fileType');
     await fs.rename(
       path.join(resolveArchiveFolder(folder), `${file}.${fileType}`),
       path.join(resolveArchiveFolder(folder), `${newFile}.${fileType}`)
@@ -146,8 +219,13 @@ module.exports = {
     return true;
   },
 
+  modifyFile_access: 'self',
+
   modifyFile_meta: true,
-  async modifyFile({ folder, file, changeSet, mergedRows, mergeKey, mergeMode }) {
+  async modifyFile({ folder, file, changeSet, mergedRows, mergeKey, mergeMode }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
     await jsldata.closeDataStore(`archive://${folder}/${file}`);
     const changedFilePath = path.join(resolveArchiveFolder(folder), `${file}.jsonl`);
 
@@ -185,17 +263,26 @@ module.exports = {
     return true;
   },
 
+  renameFolder_access: 'self',
+
   renameFolder_meta: true,
-  async renameFolder({ folder, newFolder }) {
+  async renameFolder({ folder, newFolder }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(newFolder, 'newFolder');
     const uniqueName = await this.getNewArchiveFolder({ database: newFolder });
     await fs.rename(path.join(archivedir(), folder), path.join(archivedir(), uniqueName));
     socket.emitChanged(`archive-folders-changed`);
     return true;
   },
 
+  deleteFolder_access: 'self',
+
   deleteFolder_meta: true,
-  async deleteFolder({ folder }) {
+  async deleteFolder({ folder }, req) {
+    await testStandardPermission('archive/write', req);
     if (!folder) throw new Error('Missing folder parameter');
+    assertSafeArchiveName(folder, 'folder');
     if (folder.endsWith('.link') || folder.endsWith('.zip')) {
       await fs.unlink(path.join(archivedir(), folder));
     } else {
@@ -205,15 +292,25 @@ module.exports = {
     return true;
   },
 
+  saveText_access: 'self',
+
   saveText_meta: true,
-  async saveText({ folder, file, text }) {
+  async saveText({ folder, file, text }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
     await fs.writeFile(path.join(resolveArchiveFolder(folder), `${file}.jsonl`), text);
     socket.emitChanged(`archive-files-changed`, { folder });
     return true;
   },
 
+  saveJslData_access: 'self',
+
   saveJslData_meta: true,
-  async saveJslData({ folder, file, jslid, changeSet }) {
+  async saveJslData({ folder, file, jslid, changeSet }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
     const source = getJslFileName(jslid);
     const target = path.join(resolveArchiveFolder(folder), `${file}.jsonl`);
     if (changeSet) {
@@ -230,13 +327,25 @@ module.exports = {
     return true;
   },
 
+  saveRows_access: 'self',
+
   saveRows_meta: true,
-  async saveRows({ folder, file, rows }) {
-    const fileStream = fs.createWriteStream(path.join(resolveArchiveFolder(folder), `${file}.jsonl`));
+  async saveRows({ folder, file, rows }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
+    const filePath = path.join(resolveArchiveFolder(folder), `${file}.jsonl`);
+    const fileStream = fs.createWriteStream(filePath);
     for (const row of rows) {
-      await fileStream.write(JSON.stringify(row) + '\n');
+      const ok = fileStream.write(JSON.stringify(row) + '\n');
+      if (!ok) {
+        await new Promise(resolve => fileStream.once('drain', resolve));
+      }
     }
-    await fileStream.close();
+    await new Promise((resolve, reject) => {
+      fileStream.end(() => resolve());
+      fileStream.on('error', reject);
+    });
     socket.emitChanged(`archive-files-changed`, { folder });
     return true;
   },
@@ -254,8 +363,12 @@ module.exports = {
     return `${name}${index}${suffix}`;
   },
 
+  getArchiveData_access: 'user',
+
   getArchiveData_meta: true,
   async getArchiveData({ folder, file }) {
+    assertSafeArchiveName(folder, 'folder');
+    assertSafeArchiveName(file, 'file');
     let rows;
     if (folder.endsWith('.zip')) {
       rows = await unzipJsonLinesFile(path.join(archivedir(), folder), `${file}.jsonl`);
@@ -265,21 +378,31 @@ module.exports = {
     return rows.filter(x => !x.__isStreamHeader);
   },
 
+  saveUploadedZip_access: 'self',
+
   saveUploadedZip_meta: true,
-  async saveUploadedZip({ filePath, fileName }) {
+  async saveUploadedZip({ filePath, fileName }, req) {
+    await testStandardPermission('archive/write', req);
     if (!fileName?.endsWith('.zip')) {
       throw new Error(`${fileName} is not a ZIP file`);
     }
-
+    assertSafeArchiveName(fileName.slice(0, -4), 'fileName');
+    if (!platformInfo.isElectron && !checkUploadedFilePath(filePath)) {
+      throw new Error('DBGM-00000 Only an uploaded file can be saved to the archive');
+    }
     const folder = await this.getNewArchiveFolder({ database: fileName });
-    await fs.copyFile(filePath, path.join(archivedir(), folder));
+    await copyExportFile(filePath, path.join(archivedir(), folder), { noFollow: !platformInfo.isElectron });
     socket.emitChanged(`archive-folders-changed`);
 
     return null;
   },
 
+  zip_access: 'self',
+
   zip_meta: true,
-  async zip({ folder }) {
+  async zip({ folder }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
     const newFolder = await this.getNewArchiveFolder({ database: folder + '.zip' });
     await zipDirectory(path.join(archivedir(), folder), path.join(archivedir(), newFolder));
     socket.emitChanged(`archive-folders-changed`);
@@ -287,8 +410,12 @@ module.exports = {
     return null;
   },
 
+  unzip_access: 'self',
+
   unzip_meta: true,
-  async unzip({ folder }) {
+  async unzip({ folder }, req) {
+    await testStandardPermission('archive/write', req);
+    assertSafeArchiveName(folder, 'folder');
     const newFolder = await this.getNewArchiveFolder({ database: folder.slice(0, -4) });
     await unzipDirectory(path.join(archivedir(), folder), path.join(archivedir(), newFolder));
     socket.emitChanged(`archive-folders-changed`);
@@ -296,8 +423,11 @@ module.exports = {
     return null;
   },
 
+  getZippedPath_access: 'user',
+
   getZippedPath_meta: true,
   async getZippedPath({ folder }) {
+    assertSafeArchiveName(folder, 'folder');
     if (folder.endsWith('.zip')) {
       return { filePath: path.join(archivedir(), folder) };
     }

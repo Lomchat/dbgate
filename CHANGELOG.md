@@ -9,6 +9,161 @@ Builds:
 - linux - application for linux
 - win - application for Windows
 
+## 7.3.4
+
+- FIXED: Excel export and import failing with "cannot save file" #1610
+
+## 7.3.3
+
+- ADDED: One-click deployment links for RepoCloud, Railway, Elestio, and Sealos in the README
+- CHANGED: Refreshed light and dark themes, buttons, menus, dialogs, and notifications
+- CHANGED: Updated application dependencies and the Electron runtime, and upgraded the Alpine Docker image to Node.js 24
+- FIXED: Redis key counts and stream pagination, including handling of large stream entry IDs #1599
+- FIXED: Disabled MongoDB column filters still being applied
+- FIXED: Export downloads failing when the workspace is stored in a hidden directory
+- FIXED: Failed SSH tunnel connections leaving background processes running and causing excessive memory usage #1605
+- FIXED: Addressed multiple security issues
+
+## 7.3.2
+
+- ADDED: Built-in Redis backup and restore with Redis command and RESP output formats, key filtering, expiration handling, and multi-database support
+- ADDED: Built-in SQLite backup and restore with options for exporting data, schema, database settings, and rowids
+- ADDED: Built-in backup and restore for local libSQL database files and Cloudflare D1 databases (Premium)
+- CHANGED: Added standard permission checks and database restrictions to built-in backup and restore operations
+- FIXED: Community MCP tool calls crashing while resolving permissions
+- FIXED: Backup file names not using the database file name and the correct format-specific extension
+
+## 7.3.1
+
+- ADDED: Built-in MySQL and MariaDB backup and restore without requiring external database tools
+- ADDED: MySQL and MariaDB backup options and table selection, with a choice of built-in or external backup and restore tools (Premium)
+- ADDED: Usage analytics control through the USAGE_ANALYTICS environment variable
+- ADDED: Centralized usage analytics settings for team administrators (Team Premium)
+- ADDED: Custom role names in environment configuration using ROLE\_<key>\_NAME, supporting names containing dashes, dots, and other special characters (Team Premium)
+- CHANGED: Improved memory usage and cleanup of query results, file handles, and temporary sorting files
+- CHANGED: Replaced the fs-reverse and byline dependencies with built-in file reading utilities to eliminate their deprecation warnings
+- FIXED: Tab duplication failing when saved tab settings contain non-JSON values
+- FIXED: Addressed multiple security issues to improve application security
+
+## 7.3.0
+
+- ADDED: Cloudflare D1 support, including database discovery, SQL execution, and schema browsing (Premium)
+- ADDED: Google sign-in with optional access restrictions and role synchronization based on Google groups (Team Premium)
+- ADDED: Optional anonymous usage analytics with a consent prompt and a toggle in Settings
+- FIXED: Improved protection of database connection credentials #1495
+
+## 7.2.6
+
+- ADDED: Built-in SQL Server backup and restore without requiring external SQL Server tools (Community)
+- ADDED: Option to stop PostgreSQL and SQL Server database restore on the first error
+- ADDED: Optional diagnostic reports for backup and restore operations
+- ADDED: OAuth user role assignment (Team Premium)
+- FIXED: Invalid JSON-like strings are no longer automatically displayed as JSON in the cell viewer #1539
+
+## 7.2.5
+
+- ADDED: Server Chat for AI-assisted querying across PostgreSQL, MySQL, MariaDB, and supported SQL Server editions (Premium)
+- ADDED: ChatGPT account connection for using Codex models in the desktop application (Premium)
+- FIXED: SQLite and LibSQL bigint values now preserve their precision #1531
+- FIXED: NPM installation failure caused by a dbgate-pg-dumper version mismatch #1533
+- FIXED: Restricted export file writes to managed directories and prevented symlink-based path escapes
+- FIXED: Prevented SSRF and local file reads in remote text and JSON Lines downloads
+- FIXED: Validated plugin package names and command dispatch to prevent unsafe plugin operations
+- FIXED: Sanitized generated script comments and directives to prevent code injection
+
+## 7.2.4
+
+- ADDED: Built-in PostgreSQL backup and restore without requiring external PostgreSQL tools (Community)
+- ADDED: PostgreSQL backup and restore options, including target PostgreSQL version and table selection (Premium)
+- ADDED: Team folder permissions can be configured using environment variables (Team Premium)
+- CHANGED: Improved Firebird metadata loading for functions, parameters, constraints, data type subtypes, and legacy server versions #1516
+- FIXED: MySQL and MariaDB system views and system-versioned tables not being displayed #1519
+- FIXED: MongoDB filters not handling boolean values correctly #1513
+- CHANGED: Improved backup, restore, and export status and error reporting
+
+## 7.2.3
+
+- ADDED: Read-only MCP server support (Community, Docker)
+- ADDED: Advanced MCP server capabilities, including query execution, data modification, and granular access control (Team Premium)
+- FIXED: Filter action buttons not being accessible when no rows match the active filter
+- ADDED: Character encoding selection for decoding binary cell values
+- ADDED: Improved SQL Server to MySQL data type conversion
+- ADDED: Decimal as a PostgreSQL dialect data type option #1490
+- FIXED: MySQL autocomplete for queries containing PARTITION clauses #1500
+
+## 7.2.1
+
+- ADDED: Editable view (Premium)
+- ADDED: MySQL ON UPDATE expression support to column definitions #1170
+- FIXED: Excel export in toolbar #1418
+- ADDED: Admin team files export (Team Premium)
+- ADDED: loggedUserCount added to health status (Team Premium)
+
+## 7.2.0
+
+- ADDED: Editable query results (Premium)
+- ADDED: Option to minify JSON when editing cell values #1477
+- FIXED: Improved spacing for numeric values in the data grid #1467
+- ADDED: Sticky scrolling for log messages #1444
+
+## 7.1.13
+
+- FIXED: Resolved scrolling issues in DataGrid
+- FIXED: Corrected enum select dropdown positioning #1216
+- FIXED: Improved Excel export handling for numeric columns #1464
+- ADDED: Spinner for backup file downloads #1314
+
+## 7.1.12
+
+- FIXED: Resolved DataGrid scrolling issues #1458, #1428, #1402, #1043, #686, #338
+- FIXED: Application crash when using external sort with JSONL files
+- FIXED: Application crash caused by invalid geometry/geography points #1450
+- CHANGED: Improved column resizing usability by increasing the resize handle area #1383
+- ADDED: Displaying schema information in database search #1449
+- CHANGED: Campaigns migrated to new infrastructure, improving availability
+- CHANGED: Improved performance for large databases
+
+## 7.1.11
+
+- CHANGED: AI Gateway migrated; endpoints now on new infrastructure, improving availability
+- CHANGED: Auth proxy migrated; endpoints now on new infrastructure, improving trial and licence availability
+- ADDED: Option to preserve logs #1446
+- CHANGED: Improved loading state handling for database connections and SQL object list components
+
+## 7.1.10
+
+- CHANGED: Private DbGate cloud migrated; endpoints now on new infrastructure, improving availability
+- CHANGED: DbGate Identity migrated, improving availability; requires upgrading to the new version; not backward compatible
+- FIXED: Excel export now correctly handles long table names #1441
+- FIXED: Sometimes SQL file is saved to incorrect team folder (Team Premium)
+
+## 7.1.9
+
+- FIXED: writeQueryHistory function error #1432
+- FIXED: UUID parsing issues #1434, #1431
+- ADDED: Validation for function and file names, fixed security issues
+- CHANGED: Public DbGate cloud migrated; endpoints now on new infrastructure, improving availability
+
+## 7.1.8
+
+- FIXED: NPM packages build
+
+## 7.1.7
+
+- FIXED: Resolved duplicate translation tags #1420
+- FIXED: Referer error on map display #1418
+- FIXED: Export failure when password mode is enabled #1409
+- FIXED: Unreadable text in export #1408
+- FIXED: Column names set to "undefined" in export #1406
+- FIXED: Fixed freezing issues with large fields #1399
+- ADDED: "Fetch All" button #1398
+- ADDED: Option to disable AI features
+- ADDED: PostgreSQL loading optimalization
+
+## 7.1.6
+
+- FIXED: Issues with cloud and file loading
+
 ## 7.1.5
 
 - FIXED: Issues with cloud and file loading

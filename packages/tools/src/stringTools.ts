@@ -12,6 +12,13 @@ import isPlainObject from 'lodash/isPlainObject';
 import md5 from 'blueimp-md5';
 
 export const MAX_GRID_TEXT_LENGTH = 1000; // maximum length of text in grid cell, longer text is truncated
+export const MAX_GRID_BINARY_SIZE = 10000; // maximum binary size (base64 chars or byte count) before showing 'too large' in grid cell
+
+function formatByteSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 
 export type EditorDataType =
   | 'null'
@@ -29,6 +36,20 @@ const dateTimeStorageRegex =
 
 const dateTimeParseRegex =
   /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(\.[0-9]+)?(([Zz])|()|([\+|\-]([01][0-9]|2[0-3]):[0-5][0-9]))$/;
+
+// Escapes a value for use inside a single-quoted SQL string literal. escapeChar is the dialect's
+// stringEscapeChar: "'" doubles quotes (standard SQL), '\\' escapes quotes and backslashes (MySQL).
+export function escapeSqlString(value: string, escapeChar: string = "'") {
+  let res = '';
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c == escapeChar || c == "'") {
+      res += escapeChar;
+    }
+    res += c;
+  }
+  return res;
+}
 
 export function arrayToHexString(byteArray) {
   return byteArray.reduce((output, elem) => output + ('0' + elem.toString(16)).slice(-2), '').toUpperCase();
@@ -102,19 +123,21 @@ export function parseCellValue(value, editorTypes?: DataEditorTypesBehaviour) {
   }
 
   if (editorTypes?.parseHexAsBuffer) {
-    const mUuid3 = value.match(uuid3WrapperRegex);
-    if (mUuid3) {
-      const base64Uuid3 = uuidToBase64(mUuid3[1]);
-      if (base64Uuid3 != null) return { $binary: { base64: base64Uuid3, subType: '03' } };
-    }
-    const mUuid4 = value.match(uuid4WrapperRegex);
-    if (mUuid4) {
-      const base64Uuid4 = uuidToBase64(mUuid4[1]);
-      if (base64Uuid4 != null) return { $binary: { base64: base64Uuid4, subType: '04' } };
-    }
-    if (uuidRegex.test(value)) {
-      const base64UuidPlain = uuidToBase64(value);
-      if (base64UuidPlain != null) return { $binary: { base64: base64UuidPlain, subType: '04' } };
+    if (editorTypes?.parseUuid) {
+      const mUuid3 = value.match(uuid3WrapperRegex);
+      if (mUuid3) {
+        const base64Uuid3 = uuidToBase64(mUuid3[1]);
+        if (base64Uuid3 != null) return { $binary: { base64: base64Uuid3, subType: '03' } };
+      }
+      const mUuid4 = value.match(uuid4WrapperRegex);
+      if (mUuid4) {
+        const base64Uuid4 = uuidToBase64(mUuid4[1]);
+        if (base64Uuid4 != null) return { $binary: { base64: base64Uuid4, subType: '04' } };
+      }
+      if (uuidRegex.test(value)) {
+        const base64UuidPlain = uuidToBase64(value);
+        if (base64UuidPlain != null) return { $binary: { base64: base64UuidPlain, subType: '04' } };
+      }
     }
     const mHex = value.match(/^0x([0-9a-fA-F][0-9a-fA-F])+$/);
     if (mHex) {
@@ -318,21 +341,20 @@ export function stringifyCellValue(
 
   if (value?.$binary?.base64) {
     const subType = value.$binary.subType;
-    if (subType === '03' || subType === '04') {
-      const uuidStr = base64ToUuid(value.$binary.base64);
-      if (uuidStr != null) {
-        if (intent === 'gridCellIntent' || intent === 'exportIntent' || intent === 'clipboardIntent' || intent === 'stringConversionIntent') {
-          return { value: uuidStr, gridStyle: 'valueCellStyle' };
-        }
-        // For editing intents: tag with subType so parseCellValue can round-trip it
+    const isUuidType = subType === '03' || subType === '04' || editorTypes?.parseUuid;
+    const uuidStr = isUuidType ? base64ToUuid(value.$binary.base64) : null;
+    if (uuidStr != null) {
+      // MongoDB editing intents: wrap with UUID()/UUID3() so parseCellValue can round-trip it
+      if (editorTypes?.parseUuid && intent !== 'gridCellIntent' && intent !== 'exportIntent' && intent !== 'clipboardIntent' && intent !== 'stringConversionIntent') {
         const tag = subType === '03' ? 'UUID3' : 'UUID';
         return { value: `${tag}("${uuidStr}")`, gridStyle: 'valueCellStyle' };
       }
+      return { value: uuidStr, gridStyle: 'valueCellStyle' };
     }
-    return {
-      value: base64ToHex(value.$binary.base64),
-      gridStyle: 'valueCellStyle',
-    };
+    if (intent === 'gridCellIntent' && value.$binary.base64.length > MAX_GRID_BINARY_SIZE) {
+      return { value: `(Field too large, ${formatByteSize(Math.round(value.$binary.base64.length * 3 / 4))})`, gridStyle: 'nullCellStyle' };
+    }
+    return { value: base64ToHex(value.$binary.base64), gridStyle: 'valueCellStyle' };
   }
 
   if (value?.$decimal) {
@@ -414,6 +436,14 @@ export function stringifyCellValue(
         value: `$ref: ${value.$fsDocumentRef.documentPath ?? ''}`,
         gridStyle: 'valueCellStyle',
       };
+    }
+  }
+
+  if (value?.type === 'Buffer' && _isArray(value.data)) {
+    if (intent === 'gridCellIntent') {
+      return value.data.length > MAX_GRID_BINARY_SIZE
+        ? { value: `(Field too large, ${formatByteSize(value.data.length)})`, gridStyle: 'nullCellStyle' }
+        : { value: '0x' + arrayToHexString(value.data), gridStyle: 'valueCellStyle' };
     }
   }
 
@@ -545,7 +575,7 @@ export function shouldOpenMultilineDialog(value) {
 }
 
 export function isJsonLikeLongString(value) {
-  return _isString(value) && value.length > 100 && value.match(/^\s*\{.*\}\s*$|^\s*\[.*\]\s*$/m);
+  return _isString(value) && value.length > 100 && value.length <= MAX_GRID_BINARY_SIZE && value.match(/^\s*\{.*\}\s*$|^\s*\[.*\]\s*$/m);
 }
 
 export function getIconForRedisType(type) {
@@ -707,11 +737,46 @@ export function extractErrorStackTrace(err) {
   return stack;
 }
 
+// A URL may carry credentials in its user info ("https://user:secret@host/"), in the query string
+// and in the fragment (e.g. "#access_token=...") - only the scheme, host and path are logged.
+function urlForLog(url) {
+  if (!_isString(url)) return undefined;
+  try {
+    const parsed = new URL(url);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    // a relative URL (resolved by axios against its baseURL), possibly a protocol-relative one
+    return url.split(/[?#]/)[0].replace(/^((?:[a-z][a-z0-9+.-]*:)?\/\/)[^/]*@/i, '$1');
+  }
+}
+
+// An HTTP client (axios) error carries the whole request it failed on - with its headers
+// (Authorization, API keys) and body - and the whole response. Logged as it is, that ends up in
+// the log files and in the application log shown in the UI. Only what describes the failure is kept.
+function errorObjectForLog(err) {
+  if (err?.isAxiosError || (err?.config && (err?.request || err?.response))) {
+    return {
+      name: err.name,
+      message: err.message,
+      code: err.code,
+      status: err.response?.status,
+      statusText: err.response?.statusText,
+      method: err.config?.method,
+      url: urlForLog(err.config?.url),
+    };
+  }
+  return err;
+}
+
 export function extractErrorLogData(err, additionalFields = {}) {
   if (!err) return null;
   return {
     errorMessage: extractErrorMessage(err),
-    errorObject: err,
+    errorObject: errorObjectForLog(err),
     errorStack: extractErrorStackTrace(err),
     ...additionalFields,
   };

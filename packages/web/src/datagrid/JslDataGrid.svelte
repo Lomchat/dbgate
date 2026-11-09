@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { trackUsage } from '../utility/usageAnalytics';
   import { createGridCache, createGridConfig, JslGridDisplay, runMacro, runMacroOnChangeSet } from 'dbgate-datalib';
   import { generateTablePairingId, processJsonDataUpdateCommands } from 'dbgate-tools';
   import { writable } from 'svelte/store';
@@ -9,10 +10,15 @@
   import DataGrid from './DataGrid.svelte';
   import JslDataGridCore from './JslDataGridCore.svelte';
   import { useSettings } from '../utility/metadataLoaders';
+  import { isProApp } from '../utility/proTools';
 
   export let jslid;
   export let supportsReload = false;
   export let listenInitializeFile = false;
+  export let logQueryMetadata = false;
+  export let queryResultEditing = false;
+  export let dbinfo = null;
+  export let onQueryResultInfoLoaded = null;
 
   export let changeSetState = null;
   export let changeSetStore = null;
@@ -25,6 +31,7 @@
 
   let loadedRows;
   let infoCounter = 0;
+  let lastLoggedQueryMetadataKey = null;
 
   $: info = useApiCall('jsldata/get-info', { jslid, infoCounter, infoLoadCounter }, {});
 
@@ -38,7 +45,15 @@
   }
 
   function handleRunMacro(macro, params, cells) {
-    const newChangeSet = runMacroOnChangeSet(macro, params, cells, changeSetState?.value, display, true);
+    trackUsage({ feature: 'data_grid', action: 'run_macro' });
+    const newChangeSet = runMacroOnChangeSet(
+      macro,
+      params,
+      cells,
+      changeSetState?.value,
+      display,
+      !effectiveQueryResultEditing
+    );
     if (newChangeSet) {
       dispatchChangeSet({ type: 'set', value: newChangeSet });
     }
@@ -59,8 +74,35 @@
 
   $: infoWithPairingId = generateTablePairingId($info);
   $: infoUsed = (allowChangeChangeSetStructure && changeSetState?.value?.structure) || infoWithPairingId;
+  $: effectiveQueryResultEditing = queryResultEditing && isProApp();
 
   // $: console.log('infoUsed', infoUsed);
+
+  function logEditableQueryMetadata(info) {
+    const columns = info?.columns || [];
+    const editableColumns = columns.filter(column => column.tableName && column.sourceColumnName);
+    const logKey = `${jslid}:${infoCounter}:${columns.length}:${editableColumns.length}`;
+    if (!logQueryMetadata || !info || lastLoggedQueryMetadataKey == logKey) return;
+
+    lastLoggedQueryMetadataKey = logKey;
+    console.log('DbGate query result metadata', {
+      jslid,
+      isEditable: editableColumns.length > 0,
+      editableColumnCount: editableColumns.length,
+      columnCount: columns.length,
+      columns: columns.map(column => ({
+        columnName: column.columnName,
+        tableName: column.tableName,
+        tableSchema: column.tableSchema,
+        sourceColumnName: column.sourceColumnName,
+        isPrimaryKey: column.isPrimaryKey,
+        isEditable: !!(column.tableName && column.sourceColumnName),
+      })),
+    });
+  }
+
+  $: logEditableQueryMetadata(infoUsed);
+  $: if (effectiveQueryResultEditing && infoUsed) onQueryResultInfoLoaded?.(infoUsed);
 
   $: display = new JslGridDisplay(
     jslid,
@@ -72,9 +114,11 @@
     loadedRows,
     infoUsed?.__isDynamicStructure,
     supportsReload,
-    !!changeSetState,
+    !!(changeSetState || dispatchChangeSet),
     driver,
-    $settingsValue
+    $settingsValue,
+    effectiveQueryResultEditing,
+    dbinfo
   );
 
   function handleSetLoadedRows(rows) {
@@ -97,6 +141,7 @@
     expandMacros={!!dispatchChangeSet}
     onRunMacro={handleRunMacro}
     macroCondition={infoUsed?.__isDynamicStructure ? null : macro => macro.type == 'transformValue'}
+    queryResultEditing={effectiveQueryResultEditing}
     hasMultiColumnFilter
     {changeSetState}
     {changeSetStore}

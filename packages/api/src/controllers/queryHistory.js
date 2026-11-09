@@ -1,10 +1,10 @@
-const fsReverse = require('fs-reverse');
 const fs = require('fs-extra');
 const path = require('path');
 const { datadir } = require('../utility/directories');
 const _ = require('lodash');
 const { filterName } = require('dbgate-tools');
 const socket = require('../utility/socket');
+const readFileReverse = require('../utility/readFileReverse');
 
 function readCore(reader, skip, limit, filter) {
   return new Promise((resolve, reject) => {
@@ -29,23 +29,40 @@ function readCore(reader, skip, limit, filter) {
         reject(err);
       }
     });
+    reader.on('error', err => reject(err));
     reader.on('end', () => resolve(res));
   });
 }
 
+async function readJsonl({ skip, limit, filter }) {
+  const fileName = path.join(datadir(), 'query-history.jsonl');
+  // @ts-ignore
+  if (!(await fs.exists(fileName))) return [];
+  const reader = readFileReverse(fileName);
+  return readCore(reader, skip, limit, filter);
+}
+
 module.exports = {
+  read_access: { permission: 'widgets/history' },
   read_meta: true,
-  async read({ skip, limit, filter }) {
-    const fileName = path.join(datadir(), 'query-history.jsonl');
-    // @ts-ignore
-    if (!(await fs.exists(fileName))) return [];
-    const reader = fsReverse(fileName);
-    const res = await readCore(reader, skip, limit, filter);
-    return res;
+  async read({ skip, limit, filter }, req) {
+    const storage = require('./storage');
+    const storageResult = await storage.readQueryHistory({ skip, limit, filter }, req);
+    if (storageResult) return storageResult;
+    return readJsonl({ skip, limit, filter });
   },
 
+  write_access: 'user',
+
   write_meta: true,
-  async write({ data }) {
+  async write({ data }, req) {
+    const storage = require('./storage');
+    const written = await storage.writeQueryHistory({ data }, req);
+    if (written) {
+      socket.emit('query-history-changed');
+      return 'OK';
+    }
+
     const fileName = path.join(datadir(), 'query-history.jsonl');
     await fs.appendFile(fileName, JSON.stringify(data) + '\n');
     socket.emit('query-history-changed');

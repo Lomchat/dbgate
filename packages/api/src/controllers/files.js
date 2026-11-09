@@ -8,6 +8,7 @@ const {
   loadPermissionsFromRequest,
   loadFilePermissionsFromRequest,
   getFilePermissionRole,
+  testStandardPermission,
 } = require('../utility/hasPermission');
 const socket = require('../utility/socket');
 const scheduler = require('./scheduler');
@@ -18,9 +19,28 @@ const dbgateApi = require('../shell');
 const { getLogger, getSqlFrontMatter } = require('dbgate-tools');
 const yaml = require('js-yaml');
 const platformInfo = require('../utility/platformInfo');
-const { checkSecureFilePathsWithoutDirectory, checkSecureDirectories } = require('../utility/security');
+const {
+  checkSecureFilePathsWithoutDirectory,
+  checkSecureDirectories,
+  checkSecureExportFilePath,
+  checkUploadedFilePath,
+  writeExportFile,
+  writeExportFileStream,
+  copyExportFile,
+  SecureExportWriteRefusedError,
+} = require('../utility/security');
 const { copyAppLogsIntoFile, getRecentAppLogRecords } = require('../utility/appLogStore');
 const logger = getLogger('files');
+
+// Team Premium file permissions (Administration - roles/users - files): a disk file can be
+// denied to a user who otherwise may read or write its folder. Without storage there are no
+// file permissions, so nothing is denied (as in apps.getAllApps).
+async function isDiskFileDenied(folder, file, req, loadedPermissions) {
+  if (!req || !process.env.STORAGE_DATABASE) return false;
+  if (hasPermission('all-disk-files', loadedPermissions)) return false;
+  const filePermissions = await loadFilePermissionsFromRequest(req);
+  return getFilePermissionRole(folder, file, filePermissions) == 'deny';
+}
 
 function serialize(format, data) {
   if (format == 'text') return data;
@@ -35,13 +55,20 @@ function deserialize(format, text) {
 }
 
 module.exports = {
+  isDiskFileDenied,
+  list_access: 'self',
   list_meta: true,
   async list({ folder, parseFrontMatter }, req) {
+    // folder is a directory name in filesdir - '../..' would list any server directory
+    if (typeof folder != 'string' || !folder || !checkSecureFilePathsWithoutDirectory(folder)) return [];
     const loadedPermissions = await loadPermissionsFromRequest(req);
     if (!hasPermission(`files/${folder}/read`, loadedPermissions)) return [];
     const dir = path.join(filesdir(), folder);
     if (!(await fs.exists(dir))) return [];
-    const fileNames = await fs.readdir(dir);
+    const fileNames = [];
+    for (const file of await fs.readdir(dir)) {
+      if (!(await isDiskFileDenied(folder, file, req, loadedPermissions))) fileNames.push(file);
+    }
     if (!parseFrontMatter) {
       return fileNames.map(file => ({ folder, file }));
     }
@@ -78,6 +105,8 @@ module.exports = {
     return result;
   },
 
+  listAll_access: 'self',
+
   listAll_meta: true,
   async listAll(_params, req) {
     const loadedPermissions = await loadPermissionsFromRequest(req);
@@ -86,11 +115,14 @@ module.exports = {
     for (const folder of folders) {
       if (!hasPermission(`files/${folder}/read`, loadedPermissions)) continue;
       const dir = path.join(filesdir(), folder);
-      const files = (await fs.readdir(dir)).map(file => ({ folder, file }));
-      res.push(...files);
+      for (const file of await fs.readdir(dir)) {
+        if (!(await isDiskFileDenied(folder, file, req, loadedPermissions))) res.push({ folder, file });
+      }
     }
     return res;
   },
+
+  delete_access: 'self',
 
   delete_meta: true,
   async delete({ folder, file }, req) {
@@ -99,12 +131,15 @@ module.exports = {
     if (!checkSecureFilePathsWithoutDirectory(folder, file)) {
       return false;
     }
+    if (await isDiskFileDenied(folder, file, req, loadedPermissions)) return false;
     await fs.unlink(path.join(filesdir(), folder, file));
     socket.emitChanged(`files-changed`, { folder });
     socket.emitChanged(`all-files-changed`);
     this.emitChangedFolder(folder);
     return true;
   },
+
+  rename_access: 'self',
 
   rename_meta: true,
   async rename({ folder, file, newFile }, req) {
@@ -113,11 +148,19 @@ module.exports = {
     if (!checkSecureFilePathsWithoutDirectory(folder, file, newFile)) {
       return false;
     }
+    if (
+      (await isDiskFileDenied(folder, file, req, loadedPermissions)) ||
+      (await isDiskFileDenied(folder, newFile, req, loadedPermissions))
+    ) {
+      return false;
+    }
     await fs.rename(path.join(filesdir(), folder, file), path.join(filesdir(), folder, newFile));
     socket.emitChanged(`files-changed`, { folder });
     socket.emitChanged(`all-files-changed`);
     return true;
   },
+
+  refresh_access: 'user',
 
   refresh_meta: true,
   async refresh({ folders }, req) {
@@ -128,6 +171,8 @@ module.exports = {
     return true;
   },
 
+  copy_access: 'self',
+
   copy_meta: true,
   async copy({ folder, file, newFile }, req) {
     const loadedPermissions = await loadPermissionsFromRequest(req);
@@ -135,11 +180,19 @@ module.exports = {
       return false;
     }
     if (!hasPermission(`files/${folder}/write`, loadedPermissions)) return false;
+    if (
+      (await isDiskFileDenied(folder, file, req, loadedPermissions)) ||
+      (await isDiskFileDenied(folder, newFile, req, loadedPermissions))
+    ) {
+      return false;
+    }
     await fs.copyFile(path.join(filesdir(), folder, file), path.join(filesdir(), folder, newFile));
     socket.emitChanged(`files-changed`, { folder });
     socket.emitChanged(`all-files-changed`);
     return true;
   },
+
+  load_access: 'self',
 
   load_meta: true,
   async load({ folder, file, format }, req) {
@@ -160,10 +213,13 @@ module.exports = {
     } else {
       const loadedPermissions = await loadPermissionsFromRequest(req);
       if (!hasPermission(`files/${folder}/read`, loadedPermissions)) return null;
+      if (await isDiskFileDenied(folder, file, req, loadedPermissions)) return null;
       const text = await fs.readFile(path.join(filesdir(), folder, file), { encoding: 'utf-8' });
       return deserialize(format, text);
     }
   },
+
+  loadFrom_access: 'electron',
 
   loadFrom_meta: true,
   async loadFrom({ filePath, format }, req) {
@@ -183,6 +239,8 @@ module.exports = {
       socket.emitChanged('files-changed-favorites');
     }
   },
+
+  save_access: 'self',
 
   save_meta: true,
   async save({ folder, file, data, format }, req) {
@@ -207,6 +265,7 @@ module.exports = {
       return true;
     } else {
       if (!hasPermission(`files/${folder}/write`, loadedPermissions)) return false;
+      if (await isDiskFileDenied(folder, file, req, loadedPermissions)) return false;
       const dir = path.join(filesdir(), folder);
       if (!(await fs.exists(dir))) {
         await fs.mkdir(dir);
@@ -223,6 +282,8 @@ module.exports = {
     }
   },
 
+  saveAs_access: 'electron',
+
   saveAs_meta: true,
   async saveAs({ filePath, data, format }) {
     if (!platformInfo.isElectron) {
@@ -232,6 +293,8 @@ module.exports = {
 
     await fs.writeFile(filePath, serialize(format, data));
   },
+
+  favorites_access: 'self',
 
   favorites_meta: true,
   async favorites(_params, req) {
@@ -253,8 +316,13 @@ module.exports = {
     return res;
   },
 
+  generateUploadsFile_access: 'user',
+
   generateUploadsFile_meta: true,
   async generateUploadsFile({ extension }) {
+    if (extension != null && (typeof extension != 'string' || !/^[A-Za-z0-9]{1,16}$/.test(extension))) {
+      throw new Error('DBGM-00000 Invalid file extension');
+    }
     const fileName = `${crypto.randomUUID()}.${extension || 'html'}`;
     return {
       fileName,
@@ -262,44 +330,126 @@ module.exports = {
     };
   },
 
+  exportChart_access: 'user',
+
   exportChart_meta: true,
   async exportChart({ filePath, title, config, image, plugins }) {
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     const fileName = path.parse(filePath).base;
     const imageFile = fileName.replace('.html', '-preview.png');
     const html = getChartExport(title, config, imageFile, plugins);
-    await fs.writeFile(filePath, html);
+    try {
+      await writeExportFile(filePath, html, { noFollow: !platformInfo.isElectron });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     if (image) {
       const index = image.indexOf('base64,');
       if (index > 0) {
         const data = image.substr(index + 'base64,'.length);
         const buf = Buffer.from(data, 'base64');
-        await fs.writeFile(filePath.replace('.html', '-preview.png'), buf);
+        const previewFilePath = filePath.replace('.html', '-preview.png');
+        // previewFilePath is a distinct destination from filePath (eg. a pre-existing symlink
+        // named "...-preview.png" would not have been caught by the check above), so validate it
+        // separately rather than assuming it inherits filePath's already-checked safety.
+        if (!platformInfo.isElectron && !checkSecureExportFilePath(previewFilePath)) {
+          logger.warn(
+            { filePath: previewFilePath },
+            'DBGM-00000 Refused export write outside managed data directories'
+          );
+          return false;
+        }
+        try {
+          await writeExportFile(previewFilePath, buf, { noFollow: !platformInfo.isElectron });
+        } catch (err) {
+          if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+          logger.warn(
+            { filePath: previewFilePath },
+            'DBGM-00000 Refused export write outside managed data directories'
+          );
+          return false;
+        }
       }
     }
     return true;
   },
 
+  exportMap_access: 'user',
+
   exportMap_meta: true,
   async exportMap({ filePath, geoJson }) {
-    await fs.writeFile(filePath, getMapExport(geoJson));
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
+    try {
+      await writeExportFile(filePath, getMapExport(geoJson), { noFollow: !platformInfo.isElectron });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     return true;
   },
+
+  exportDiagram_access: 'user',
 
   exportDiagram_meta: true,
   async exportDiagram({ filePath, html, css, themeType, themeVariables, watermark }) {
-    await fs.writeFile(filePath, getDiagramExport(html, css, themeType, themeVariables, watermark));
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
+    try {
+      await writeExportFile(filePath, getDiagramExport(html, css, themeType, themeVariables, watermark), {
+        noFollow: !platformInfo.isElectron,
+      });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     return true;
   },
+
+  exportDiagramPng_access: 'user',
 
   exportDiagramPng_meta: true,
   async exportDiagramPng({ filePath, pngBase64 }) {
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     const base64 = pngBase64.replace(/^data:image\/png;base64,/, '');
-    await fs.writeFile(filePath, Buffer.from(base64, 'base64'));
+    try {
+      await writeExportFile(filePath, Buffer.from(base64, 'base64'), { noFollow: !platformInfo.isElectron });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     return true;
   },
 
+  getFileRealPath_access: 'self',
+
   getFileRealPath_meta: true,
   async getFileRealPath({ folder, file }, req) {
+    // folder (with its archive: / app: prefix) and file are names - '../..' would point anywhere
+    if (
+      typeof folder != 'string' ||
+      typeof file != 'string' ||
+      !folder ||
+      !file ||
+      !checkSecureFilePathsWithoutDirectory(folder, file)
+    ) {
+      return false;
+    }
     const loadedPermissions = await loadPermissionsFromRequest(req);
     if (folder.startsWith('archive:')) {
       if (!hasPermission(`archive/write`, loadedPermissions)) return false;
@@ -311,6 +461,7 @@ module.exports = {
       return path.join(appdir(), app, file);
     } else {
       if (!hasPermission(`files/${folder}/write`, loadedPermissions)) return false;
+      if (await isDiskFileDenied(folder, file, req, loadedPermissions)) return false;
       const dir = path.join(filesdir(), folder);
       if (!(await fs.exists(dir))) {
         await fs.mkdir(dir);
@@ -319,36 +470,79 @@ module.exports = {
     }
   },
 
+  createZipFromJsons_access: 'electron',
+
   createZipFromJsons_meta: true,
   async createZipFromJsons({ db, filePath }) {
     logger.info(`DBGM-00011 Creating zip file from JSONS ${filePath}`);
-    await dbgateApi.zipJsonLinesData(db, filePath);
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
+    try {
+      await writeExportFileStream(filePath, output => dbgateApi.zipJsonLinesData(db, output), {
+        noFollow: !platformInfo.isElectron,
+      });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     return true;
   },
 
+  getJsonsFromZip_access: 'user',
+
   getJsonsFromZip_meta: true,
   async getJsonsFromZip({ filePath }) {
+    // the connections & settings import reads the ZIP the user uploaded
+    if (!platformInfo.isElectron && !checkUploadedFilePath(filePath)) {
+      throw new Error('DBGM-00000 Only an uploaded file can be imported');
+    }
     const res = await dbgateApi.unzipJsonLinesData(filePath);
     return res;
   },
 
+  downloadText_access: 'user',
+
   downloadText_meta: true,
   async downloadText({ uri }, req) {
     if (!uri) return null;
-    const filePath = await dbgateApi.download(uri);
+    const filePath = await dbgateApi.download(uri, { safeRemoteFetch: true });
     const text = await fs.readFile(filePath, {
       encoding: 'utf-8',
     });
     return text;
   },
 
+  saveUploadedFile_access: 'self',
+
   saveUploadedFile_meta: true,
-  async saveUploadedFile({ filePath, fileName }) {
+  async saveUploadedFile({ filePath, fileName }, req) {
+    if (!platformInfo.isElectron && !checkUploadedFilePath(filePath)) {
+      throw new Error('DBGM-00000 Only an uploaded file can be saved');
+    }
+    // the name becomes part of the target path
+    if (typeof fileName != 'string' || !checkSecureFilePathsWithoutDirectory(fileName) || fileName.includes('\0')) {
+      throw new Error('DBGM-00000 Invalid file name');
+    }
     const FOLDERS = ['sql', 'sqlite'];
     for (const folder of FOLDERS) {
       if (fileName.toLowerCase().endsWith('.' + folder)) {
+        const loadedPermissions = await loadPermissionsFromRequest(req);
+        if (!hasPermission(`files/${folder}/write`, loadedPermissions)) {
+          throw new Error(`DBGM-00000 Permission files/${folder}/write not granted`);
+        }
+        // a file denied to the caller cannot be overwritten by an upload either, as in save
+        if (await isDiskFileDenied(folder, fileName, req, loadedPermissions)) {
+          throw new Error(`DBGM-00000 Permission for file ${fileName} not granted`);
+        }
         logger.info(`DBGM-00012 Saving ${folder} file ${fileName}`);
-        await fs.copyFile(filePath, path.join(filesdir(), folder, fileName));
+        const targetDir = path.join(filesdir(), folder);
+        await copyExportFile(filePath, path.join(targetDir, fileName), {
+          noFollow: !platformInfo.isElectron,
+          extraAllowedDirs: [targetDir],
+        });
 
         socket.emitChanged(`files-changed`, { folder: folder });
         socket.emitChanged(`all-files-changed`);
@@ -362,27 +556,60 @@ module.exports = {
     throw new Error(`DBGM-00013 ${fileName} doesn't have one of supported extensions: ${FOLDERS.join(', ')}`);
   },
 
+  exportFile_access: 'self',
+
   exportFile_meta: true,
   async exportFile({ folder, file, filePath }, req) {
+    // the source must be a file directly in the folder - '../..' would copy any server file
+    if (typeof folder != 'string' || typeof file != 'string' || !checkSecureFilePathsWithoutDirectory(folder, file)) {
+      return false;
+    }
     const loadedPermissions = await loadPermissionsFromRequest(req);
     if (!hasPermission(`files/${folder}/read`, loadedPermissions)) return false;
-    await fs.copyFile(path.join(filesdir(), folder, file), filePath);
+    if (await isDiskFileDenied(folder, file, req, loadedPermissions)) return false;
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
+    try {
+      await copyExportFile(path.join(filesdir(), folder, file), filePath, { noFollow: !platformInfo.isElectron });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     return true;
   },
+
+  simpleCopy_access: 'user',
 
   simpleCopy_meta: true,
   async simpleCopy({ sourceFilePath, targetFilePath }, req) {
     if (!platformInfo.isElectron) {
-      if (!checkSecureDirectories(sourceFilePath, targetFilePath)) {
+      if (!checkSecureDirectories(sourceFilePath) || !checkSecureExportFilePath(targetFilePath)) {
+        logger.warn(
+          { filePath: targetFilePath },
+          'DBGM-00000 Refused export write outside managed data directories'
+        );
         return false;
       }
     }
-    await fs.copyFile(sourceFilePath, targetFilePath);
+    try {
+      await copyExportFile(sourceFilePath, targetFilePath, { noFollow: !platformInfo.isElectron });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath: targetFilePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
     return true;
   },
 
+  // The application log holds what every user did, including the SQL they ran - the same
+  // permission the UI asks for before it offers the log
+  fillAppLogs_access: 'self',
   fillAppLogs_meta: true,
-  async fillAppLogs({ dateFrom = 0, dateTo = new Date().getTime(), prepareForExport = false }) {
+  async fillAppLogs({ dateFrom = 0, dateTo = new Date().getTime(), prepareForExport = false }, req) {
+    await testStandardPermission('application-log', req);
     const jslid = crypto.randomUUID();
     const outputFile = path.join(jsldir(), `${jslid}.jsonl`);
     await copyAppLogsIntoFile(dateFrom, dateTo, outputFile, prepareForExport);
@@ -391,14 +618,28 @@ module.exports = {
     };
   },
 
+  // Also subscribes the caller's stream to new log records (socket.emitToTopic in appLogStore)
+  getRecentAppLog_access: 'self',
   getRecentAppLog_meta: true,
-  getRecentAppLog({ limit }) {
+  async getRecentAppLog({ limit }, req) {
+    await testStandardPermission('application-log', req);
+    socket.subscribeTopic(socket.getStrmidFromRequest(req), 'applog');
     const res = getRecentAppLogRecords();
     if (limit) {
       return res.slice(-limit);
     }
     return res;
   },
+
+  unsubscribeAppLog_access: 'user',
+
+  unsubscribeAppLog_meta: true,
+  async unsubscribeAppLog(_params, req) {
+    socket.unsubscribeTopic(socket.getStrmidFromRequest(req), 'applog');
+    return true;
+  },
+
+  getFileThemes_access: 'self',
 
   getFileThemes_meta: true,
   async getFileThemes(_params, req) {

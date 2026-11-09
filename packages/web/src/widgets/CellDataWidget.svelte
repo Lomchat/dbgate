@@ -89,7 +89,15 @@
 
     const value = selection.length == 1 ? selection[0].value : null;
     if (_.isString(value)) {
-      if (value.startsWith('[') || value.startsWith('{')) return 'json';
+      const trimmed = value.trim();
+      if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+        try {
+          JSON.parse(trimmed);
+          return 'json';
+        } catch {
+          // not valid JSON, fall through to other detections
+        }
+      }
     }
     if (_.isPlainObject(value) || _.isArray(value)) {
       return 'json';
@@ -110,11 +118,14 @@
   import SelectField from '../forms/SelectField.svelte';
   import ErrorInfo from '../elements/ErrorInfo.svelte';
   import { _t } from '../translations';
+  import { getContext } from 'svelte';
+  import { trackUsage } from '../utility/usageAnalytics';
 
   export let onClose;
   export let selection;
 
   let selectedFormatType = 'autodetect';
+  const usageTabId = getContext('tabid');
 
   $: autodetectFormatType = autodetect(selection);
   $: autodetectFormat = formats.find(x => x.type == autodetectFormatType);
@@ -131,7 +142,19 @@
       <SelectField
         isNative
         value={selectedFormatType}
-        on:change={e => (selectedFormatType = e.detail)}
+        on:change={e => {
+          selectedFormatType = e.detail;
+          // Only an explicit format choice is tracked, never cell selection changes.
+          trackUsage(
+            {
+              feature: 'data_grid',
+              action: 'set_cell_data_format',
+              engine: selection?.[0]?.engine?.engine,
+              param: selectedFormatType,
+            },
+            usageTabId
+          );
+        }}
         data-testid="CellDataWidget_selectFormat"
         options={[
           {

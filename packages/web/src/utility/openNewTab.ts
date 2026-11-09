@@ -1,5 +1,5 @@
 import _ from 'lodash';
-import uuidv1 from 'uuid/v1';
+import { v1 as uuidv1 } from 'uuid';
 import { getActiveTab, getOpenedTabs, openedTabs } from '../stores';
 import tabs from '../tabs';
 import { setSelectedTabFunc, switchCurrentDatabase } from './common';
@@ -8,6 +8,7 @@ import stableStringify from 'json-stable-stringify';
 import { saveAllPendingEditorData } from '../query/useEditorData';
 import { getConnectionInfo } from './metadataLoaders';
 import { getBoolSettingsValue } from '../settings/settingsTools';
+import { getUsageTabName, trackUsage } from './usageAnalytics';
 
 function findFreeNumber(numbers: number[]) {
   if (numbers.length == 0) return 1;
@@ -56,7 +57,7 @@ export default async function openNewTab(newTab, initialData: any = undefined, o
     );
   }
 
-  const { forceNewTab } = options || {};
+  const { forceNewTab, initialLocalStorage } = options || {};
 
   const component = tabs[newTab.tabComponent];
   if (!existing && !forceNewTab && component && component.matchingProps) {
@@ -87,6 +88,12 @@ export default async function openNewTab(newTab, initialData: any = undefined, o
   }
 
   const tabid = uuidv1();
+  if (initialLocalStorage) {
+    // raw values, copied verbatim (some are not JSON, eg. tabdata_limitRows_ = 'nolimit')
+    for (const key of _.keys(initialLocalStorage)) {
+      localStorage.setItem(`tabdata_${key}_${tabid}`, initialLocalStorage[key]);
+    }
+  }
   if (initialData) {
     for (const key of _.keys(initialData)) {
       if (key == 'editor' || key == 'rows') {
@@ -134,6 +141,22 @@ export default async function openNewTab(newTab, initialData: any = undefined, o
     ];
   });
 
+  if (newTab.tabComponent) {
+    void (async () => {
+      let engine: string | undefined;
+      if (newTab.props?.conid) {
+        try {
+          engine = (await getConnectionInfo({ conid: newTab.props.conid }))?.engine;
+        } catch {
+          // Opening the tab and analytics must not depend on metadata loading.
+        }
+      }
+      const openedTab = getUsageTabName(newTab);
+      // tab is the opened tab, so that events can be grouped by tab.
+      trackUsage({ feature: openedTab, action: 'open', tab: openedTab, engine });
+    })();
+  }
+
   // console.log('OPENING NEW TAB', newTab);
   // const tabid = uuidv1();
   // openedTabs.update(tabs => [
@@ -155,11 +178,12 @@ export async function duplicateTab(tab) {
 
   const keyRegex = /^tabdata_([^_]+)_([^_]+)$/;
   const initialData = {};
+  const initialLocalStorage = {};
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
     const m = key.match(keyRegex);
     if (m && m[2] == tab.tabid) {
-      initialData[m[1]] = JSON.parse(localStorage.getItem(key));
+      initialLocalStorage[m[1]] = localStorage.getItem(key);
     }
   }
   for (const key of await localforage.keys()) {
@@ -174,7 +198,7 @@ export async function duplicateTab(tab) {
       title,
     },
     initialData,
-    { forceNewTab: true }
+    { forceNewTab: true, initialLocalStorage }
   );
 }
 

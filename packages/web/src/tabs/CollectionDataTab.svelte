@@ -10,6 +10,7 @@
 
   registerCommand({
     id: 'collectionTable.save',
+    usageAnalytics: false,
     group: 'save',
     category: __t('command.collectionData', { defaultMessage: 'Collection data' }),
     name: __t('command.collectionData.save', { defaultMessage: 'Save' }),
@@ -23,6 +24,7 @@
 </script>
 
 <script lang="ts">
+  import { trackUsage } from '../utility/usageAnalytics';
   import App from '../App.svelte';
   import DataGrid from '../datagrid/DataGrid.svelte';
   import useGridConfig from '../utility/useGridConfig';
@@ -45,7 +47,8 @@
   import createActivator from '../utility/createActivator';
   import { showModal } from '../modals/modalTools';
   import ErrorMessageModal from '../modals/ErrorMessageModal.svelte';
-  import ConfirmNoSqlModal from '../modals/ConfirmNoSqlModal.svelte';  import { registerMenu } from '../utility/contextMenu';
+  import ConfirmNoSqlModal from '../modals/ConfirmNoSqlModal.svelte';
+  import { registerMenu } from '../utility/contextMenu';
   import { setContext } from 'svelte';
   import _ from 'lodash';
   import { apiCall } from '../utility/api';
@@ -56,7 +59,8 @@
   import { getBoolSettingsValue } from '../settings/settingsTools';
   import useEditorData from '../query/useEditorData';
   import { markTabSaved, markTabUnsaved } from '../utility/common';
-  import { getNumberIcon } from '../icons/FontIcon.svelte';  export let tabid;
+  import { getNumberIcon } from '../icons/FontIcon.svelte';
+  export let tabid;
   export let conid;
   export let database;
   export let schemaName;
@@ -119,6 +123,12 @@
   // $: console.log('LOADED ROWS MONGO', loadedRows);
 
   async function handleConfirmChange(changeSet) {
+    trackUsage({
+      feature: 'data_grid',
+      action: 'save_changes',
+      tab: 'collection_data',
+      engine: $connection?.engine,
+    });
     const resp = await apiCall('database-connections/update-collection', {
       conid,
       database,
@@ -164,6 +174,7 @@
   }
 
   function handleRunMacro(macro, params, cells) {
+    trackUsage({ feature: 'data_grid', action: 'run_macro', engine: $connection?.engine });
     const newChangeSet = runMacroOnChangeSet(macro, params, cells, $changeSetStore?.value, display, false);
     if (newChangeSet) {
       dispatchChangeSet({ type: 'set', value: newChangeSet });
@@ -217,8 +228,13 @@
     <ToolStripCommandButton command="dataGrid.switchToJson" hideDisabled />
     <ToolStripCommandButton command="dataGrid.switchToTable" hideDisabled />
     <ToolStripExportButton {quickExportHandlerRef} command="collectionDataGrid.export" />
+    <ToolStripCommandButton command="dataGrid.fetchAll" hideDisabled />
     <ToolStripCommandButton command="collectionJsonView.expandAll" hideDisabled />
     <ToolStripCommandButton command="collectionJsonView.collapseAll" hideDisabled />
-    <ToolStripCommandButton command="dataGrid.toggleCellDataView" hideDisabled data-testid="CollectionDataTab_toggleCellDataView" />
+    <ToolStripCommandButton
+      command="dataGrid.toggleCellDataView"
+      hideDisabled
+      data-testid="CollectionDataTab_toggleCellDataView"
+    />
   </svelte:fragment>
 </ToolStripContainer>

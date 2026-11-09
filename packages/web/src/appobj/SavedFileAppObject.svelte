@@ -189,6 +189,8 @@
 
 <script lang="ts">
   import _ from 'lodash';
+  import { trackObjectTree } from './appObjectTools';
+  import { trackUsage } from '../utility/usageAnalytics';
   import ConfirmModal from '../modals/ConfirmModal.svelte';
   import InputTextModal from '../modals/InputTextModal.svelte';
   import { showModal } from '../modals/modalTools';
@@ -212,6 +214,7 @@
   $: handler = SAVED_FILE_HANDLERS[folder] as FileTypeHandler;
 
   const showMarkdownPage = () => {
+    trackObjectTree('show_page', 'saved_file');
     openNewTab({
       title: data.file,
       icon: 'img markdown',
@@ -244,6 +247,7 @@
   }
 
   const handleDelete = () => {
+    trackObjectTree('delete', 'saved_file');
     showModal(ConfirmModal, {
       message: _t('common.reallyDeleteFile', { defaultMessage: 'Really delete file {file}?', values: { file: data.file } }),
       onConfirm: () => {
@@ -262,6 +266,7 @@
   };
 
   const handleRename = () => {
+    trackObjectTree('rename', 'saved_file');
     showModal(InputTextModal, {
       value: data.file,
       label: _t('common.newFileName', { defaultMessage: 'New file name' }),
@@ -283,6 +288,7 @@
   };
 
   const handleCopy = () => {
+    trackObjectTree('create_copy', 'saved_file');
     showModal(InputTextModal, {
       value: data.file,
       label: _t('savedFile.newFileName', { defaultMessage: 'New file name' }),
@@ -304,21 +310,22 @@
   };
 
   const handleDownload = () => {
+    trackObjectTree('download', 'saved_file');
     saveFileToDisk(
       async filePath => {
         if (data.teamFileId) {
-          await apiCall('team-files/export-file', {
+          return await apiCall('team-files/export-file', {
             teamFileId: data.teamFileId,
             filePath,
           });
         } else if (data.folid && data.cntid) {
-          await apiCall('cloud/export-file', {
+          return await apiCall('cloud/export-file', {
             folid: data.folid,
             cntid: data.cntid,
             filePath,
           });
         } else {
-          await apiCall('files/export-file', {
+          return await apiCall('files/export-file', {
             folder,
             file: data.file,
             filePath,
@@ -330,6 +337,8 @@
   };
 
   async function openTab() {
+    // folder is the file type of the saved file, e.g. sql, shell, perspectives.
+    trackUsage({ feature: 'saved_file', action: 'open', param: folder });
     let dataContent;
     if (data.teamFileId) {
       if (data?.metadata?.autoExecute) {

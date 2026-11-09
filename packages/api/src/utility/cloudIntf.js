@@ -1,4 +1,5 @@
 const axios = require('axios');
+const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const _ = require('lodash');
@@ -13,6 +14,7 @@ const socket = require('./socket');
 const config = require('../controllers/config');
 const simpleEncryptor = require('simple-encryptor');
 const currentVersion = require('../currentVersion');
+const { getUsageAnalyticsPolicy } = require('./usageAnalyticsPolicy');
 
 const logger = getLogger('cloudIntf');
 
@@ -23,18 +25,23 @@ let promoWidgetDataLoaded = false;
 const DBGATE_IDENTITY_URL = process.env.LOCAL_DBGATE_IDENTITY
   ? 'http://localhost:3103'
   : process.env.PROD_DBGATE_IDENTITY
-  ? 'https://identity.dbgate.io'
+  ? 'https://identity.dbgate.cloud'
   : process.env.DEVWEB || process.env.DEVMODE
-  ? 'https://identity.dbgate.udolni.net'
-  : 'https://identity.dbgate.io';
+  ? 'https://identity.dbgate.cloud'
+  : 'https://identity.dbgate.cloud';
 
 const DBGATE_CLOUD_URL = process.env.LOCAL_DBGATE_CLOUD
   ? 'http://localhost:3110'
   : process.env.PROD_DBGATE_CLOUD
-  ? 'https://cloud.dbgate.io'
+  ? 'https://api.dbgate.cloud'
   : process.env.DEVWEB || process.env.DEVMODE
-  ? 'https://cloud.dbgate.udolni.net'
-  : 'https://cloud.dbgate.io';
+  ? 'https://dev.dbgate.cloud'
+  : 'https://api.dbgate.cloud';
+
+const stageAxiosConfig =
+  !process.env.PROD_DBGATE_CLOUD && (process.env.DEVWEB || process.env.DEVMODE)
+    ? { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }
+    : {};
 
 async function createDbGateIdentitySession(client, redirectUri) {
   const resp = await axios.default.post(
@@ -48,6 +55,7 @@ async function createDbGateIdentitySession(client, redirectUri) {
         ...getLicenseHttpHeaders(),
         'Content-Type': 'application/json',
       },
+      ...stageAxiosConfig,
     }
   );
   return {
@@ -70,6 +78,7 @@ function startCloudTokenChecking(sid, callback) {
         headers: {
           ...getLicenseHttpHeaders(),
         },
+        ...stageAxiosConfig,
       });
       // console.log('CHECK RESP:', resp.data);
 
@@ -88,6 +97,7 @@ async function readCloudTokenHolder(sid) {
     headers: {
       ...getLicenseHttpHeaders(),
     },
+    ...stageAxiosConfig,
   });
   if (resp.data?.email) {
     return resp.data;
@@ -103,6 +113,7 @@ async function readCloudTestTokenHolder(email) {
       headers: {
         ...getLicenseHttpHeaders(),
       },
+      ...stageAxiosConfig,
     }
   );
   if (resp.data?.email) {
@@ -193,7 +204,8 @@ async function getCloudSigninHeaders(holder = null) {
   return null;
 }
 
-async function updateCloudFiles(isRefresh, language) {
+async function updateCloudFiles(isRefresh, language, usageAnalyticsConsent) {
+  usageAnalyticsConsent = (await getUsageAnalyticsPolicy()) ?? usageAnalyticsConsent;
   let lastCloudFilesTags;
   try {
     lastCloudFilesTags = await fs.readFile(path.join(datadir(), 'cloud-files-tags.txt'), 'utf-8');
@@ -212,14 +224,18 @@ async function updateCloudFiles(isRefresh, language) {
   const resp = await axios.default.get(
     `${DBGATE_CLOUD_URL}/public-cloud-updates?lastCheckedTm=${lastCheckedTm}&tags=${tags}&isRefresh=${
       isRefresh ? 1 : 0
-    }`,
+    }}`,
     {
       headers: {
         ...getLicenseHttpHeaders(),
         ...(await getCloudInstanceHeaders()),
         'x-app-version': currentVersion.version,
+        ...(typeof usageAnalyticsConsent === 'boolean'
+          ? { 'x-usage-analytics-consent': String(usageAnalyticsConsent) }
+          : {}),
         'x-app-language': language || 'en',
       },
+      ...stageAxiosConfig,
     }
   );
 
@@ -258,6 +274,7 @@ async function getPublicFileData(path) {
     headers: {
       ...getLicenseHttpHeaders(),
     },
+    ...stageAxiosConfig,
   });
   return resp.data;
 }
@@ -289,6 +306,7 @@ async function updatePremiumPromoWidget(language) {
         'x-app-version': currentVersion.version,
         'x-app-language': language || 'en',
       },
+      ...stageAxiosConfig,
     }
   );
 
@@ -302,7 +320,7 @@ async function updatePremiumPromoWidget(language) {
   socket.emitChanged(`promo-widget-changed`);
 }
 
-async function refreshPublicFiles(isRefresh, uiLanguage) {
+async function refreshPublicFiles(isRefresh, uiLanguage, usageAnalyticsConsent) {
   const language = platformInfo.isElectron
     ? (await config.getCachedSettings())?.['localization.language'] || 'en'
     : uiLanguage;
@@ -310,7 +328,7 @@ async function refreshPublicFiles(isRefresh, uiLanguage) {
     await loadCloudFiles();
   }
   try {
-    await updateCloudFiles(isRefresh, language);
+    await updateCloudFiles(isRefresh, language, usageAnalyticsConsent);
   } catch (err) {
     logger.error(extractErrorLogData(err), 'DBGM-00166 Error updating cloud files');
   }
@@ -336,6 +354,7 @@ async function callCloudApiGet(endpoint, signinHolder = null, additionalHeaders 
       ...additionalHeaders,
     },
     validateStatus: status => status < 500,
+    ...stageAxiosConfig,
   });
   const { errorMessage, isLicenseLimit, limitedLicenseLimits } = resp.data;
   if (errorMessage) {
@@ -374,6 +393,7 @@ async function callCloudApiPost(endpoint, body, signinHolder = null) {
       ...signinHeaders,
     },
     validateStatus: status => status < 500,
+    ...stageAxiosConfig,
   });
   const { errorMessage, isLicenseLimit, limitedLicenseLimits } = resp.data;
   if (errorMessage) {
@@ -472,7 +492,7 @@ function removeCloudCachedConnection(folid, cntid) {
 
 async function getPublicIpInfo() {
   try {
-    const resp = await axios.default.get(`${DBGATE_CLOUD_URL}/ipinfo`);
+    const resp = await axios.default.get(`${DBGATE_CLOUD_URL}/ipinfo`, stageAxiosConfig);
     if (!resp.data?.ip) {
       return { ip: 'unknown-ip' };
     }
@@ -488,12 +508,15 @@ async function getPromoWidgetData() {
 }
 
 async function getPromoWidgetPreview(campaign, variant) {
-  const resp = await axios.default.get(`${DBGATE_CLOUD_URL}/premium-promo-widget-preview/${campaign}/${variant}`);
+  const resp = await axios.default.get(
+    `${DBGATE_CLOUD_URL}/premium-promo-widget-preview/${campaign}/${variant}`,
+    stageAxiosConfig
+  );
   return resp.data;
 }
 
 async function getPromoWidgetList() {
-  const resp = await axios.default.get(`${DBGATE_CLOUD_URL}/promo-widget-list`);
+  const resp = await axios.default.get(`${DBGATE_CLOUD_URL}/promo-widget-list`, stageAxiosConfig);
   return resp.data;
 }
 

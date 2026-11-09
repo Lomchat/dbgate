@@ -4,10 +4,33 @@ const stream = require('stream');
 const driverBase = require('../frontend/driver');
 const Analyser = require('./Analyser');
 const Redis = require('ioredis');
-const RedisDump = require('node-redis-dump2');
+const fs = require('fs');
+const crypto = require('crypto');
+const { URL } = require('url');
+const { finished } = require('stream/promises');
+const { BufferDumpWriter, dumpRedis, restoreRedisDump } = require('dbgate-redis-dumper');
+const { fromIoredis } = require('dbgate-redis-dumper/ioredis');
+const {
+  createDumpProgressReporter,
+  createRestoreProgressReporter,
+  formatRedisRestoreError,
+  formatRestoreCommandError,
+  getRedisDumpOptions,
+  getRedisRestoreOptions,
+  parseDatabaseIndex,
+} = require('./redisDumperSupport');
 const { filterName } = global.DBGATE_PACKAGES['dbgate-tools'];
 
 let isProApp;
+
+// Dump connections must never queue or replay commands after losing their socket.
+const dumperConnectionOptions = {
+  lazyConnect: true,
+  enableOfflineQueue: false,
+  autoResendUnfulfilledCommands: false,
+  maxRetriesPerRequest: 0,
+  retryStrategy: () => null,
+};
 
 function splitCommandLine(str) {
   let results = [];
@@ -120,10 +143,147 @@ async function buildNatMapFromSeeds(seeds, redisOptions) {
   return natMap;
 }
 
+/**
+ * Makes sure the client is on the requested logical database before the dumper takes it over.
+ *
+ * connect() selects the database through ioredis options, except for database URL connections,
+ * which always open the database named in the URL. ioredis records a select() it performed itself,
+ * so the dumper's adapter then knows which database to hand the connection back on.
+ */
+async function selectRequestedDatabase(dbhan, database) {
+  const index = parseDatabaseIndex(database);
+  if (index === undefined) return;
+  const current = dbhan.client.condition?.select ?? dbhan.client.options?.db ?? 0;
+  if (current !== index) {
+    await dbhan.client.select(index);
+  }
+}
+
 /** @type {import('dbgate-types').EngineDriver} */
 const driver = {
   ...driverBase,
   analyserClass: Analyser,
+
+  async backupDatabase(connection, settings, runner) {
+    const { outputFile, database, options = {} } = settings;
+    const dumpOptions = getRedisDumpOptions(options);
+    // Dump into a sibling temporary file and publish it with a rename only once the dump finished.
+    // A failed or cancelled run therefore never leaves a truncated file behind, nor does it touch
+    // an existing backup stored under the requested name.
+    const tempFile = `${outputFile}.${crypto.randomBytes(6).toString('hex')}.part`;
+    let dbhan = null;
+    let output = null;
+    let dumperConnection = null;
+    let outputError = null;
+    const dumpAbortController = new AbortController();
+    const cancelDump = () => dumpAbortController.abort();
+    runner.signal?.addEventListener('abort', cancelDump, { once: true });
+    if (runner.signal?.aborted) cancelDump();
+
+    try {
+      dbhan = await this.connect({ ...connection, database, forDumper: true });
+      await selectRequestedDatabase(dbhan, database);
+      dumperConnection = fromIoredis(dbhan.client);
+      output = fs.createWriteStream(tempFile);
+      // File errors can arrive while the dumper is awaiting Redis, before its first write.
+      output.on('error', error => {
+        outputError = error;
+        cancelDump();
+      });
+      const result = await dumpRedis(
+        dumperConnection,
+        dumpOptions,
+        output,
+        createDumpProgressReporter(runner),
+        dumpAbortController.signal
+      );
+      if (result.cancelled) {
+        throw new Error('DBGM-00000 Redis backup cancelled');
+      }
+      output.end();
+      await finished(output);
+      await fs.promises.rename(tempFile, outputFile);
+      for (const warning of result.warnings) {
+        runner.info({ message: warning.message, severity: warning.severity });
+      }
+      runner.info({
+        message: `Wrote ${result.keysExported.toLocaleString('en-US')} keys in ${result.commandsWritten.toLocaleString(
+          'en-US'
+        )} commands and ${result.bytesWritten.toLocaleString('en-US')} bytes`,
+        severity: 'info',
+      });
+    } catch (error) {
+      if (output) {
+        output.destroy();
+        // wait for the descriptor to be released, otherwise the cleanup below can fail on Windows
+        await finished(output).catch(() => {});
+      }
+      await fs.promises.rm(tempFile, { force: true }).catch(() => {});
+      throw outputError || error;
+    } finally {
+      runner.signal?.removeEventListener('abort', cancelDump);
+      dumperConnection?.detach();
+      if (dbhan) await this.close(dbhan).catch(() => {});
+    }
+  },
+
+  async restoreDatabase(connection, settings, runner) {
+    const { inputFile, database, options = {} } = settings;
+    const restoreOptions = getRedisRestoreOptions(database, options, settings.restrictToDatabase);
+    let dbhan = null;
+    let input = null;
+    let dumperConnection = null;
+
+    try {
+      dbhan = await this.connect({ ...connection, database, forDumper: true });
+      await selectRequestedDatabase(dbhan, database);
+      dumperConnection = fromIoredis(dbhan.client);
+      input = fs.createReadStream(inputFile, { highWaterMark: 64 * 1024 });
+      const stopOnError = options.stopOnError ?? true;
+      const progress = createRestoreProgressReporter(runner);
+      const result = await restoreRedisDump({
+        connection: dumperConnection,
+        source: input,
+        signal: runner.signal,
+        options: restoreOptions,
+        progress,
+      });
+      // Reported before the error branch below, because a failed restore is exactly when warnings
+      // like a missing final newline (a truncated file) matter most.
+      for (const warning of result.warnings) {
+        runner.info({ message: warning.message, severity: 'warning' });
+      }
+      if (result.cancelled) {
+        throw new Error('DBGM-00000 Redis restore cancelled');
+      }
+      if (result.errors.length > 0) {
+        for (const error of result.errors) {
+          if (progress.reportedCommandIndexes.has(error.commandIndex)) continue;
+          runner.info({ message: formatRestoreCommandError(error), severity: 'error' });
+        }
+        const count = result.errors.length;
+        throw new Error(
+          `DBGM-00000 Redis restore ${stopOnError ? 'stopped at' : 'finished with'} ${count} error${
+            count == 1 ? '' : 's'
+          }: ${formatRestoreCommandError(result.errors[0])}`
+        );
+      }
+      runner.info({
+        message: `Restored ${result.commandsExecuted.toLocaleString(
+          'en-US'
+        )} Redis commands (${result.bytesConsumed.toLocaleString('en-US')} bytes read)`,
+        severity: 'info',
+      });
+    } catch (error) {
+      const formatted = formatRedisRestoreError(error);
+      if (formatted) throw new Error(formatted, { cause: error });
+      throw error;
+    } finally {
+      input?.destroy();
+      dumperConnection?.detach();
+      if (dbhan) await this.close(dbhan).catch(() => {});
+    }
+  },
   async connect({
     server,
     port,
@@ -138,16 +298,29 @@ const driver = {
     authType,
     clusterNodes,
     autoDetectNatMap,
+    forDumper = false,
   }) {
     let db = 0;
     let client;
+    // A dump owns its connection. Replaying a partially executed batch could duplicate writes
+    // or send them to the database ioredis remembers instead of the dump's latest SELECT.
+    const dumperOptions = forDumper ? dumperConnectionOptions : {};
+    // ioredis 6 defaults to RESP3, keep the RESP2 wire protocol used by previous versions
+    const protocolOptions = { protocol: 2 };
+    if (forDumper && !useDatabaseUrl && authType === 'cluster') {
+      throw new Error('DBGM-00000 Redis backup and restore do not support cluster connections');
+    }
     if (useDatabaseUrl) {
-      client = new Redis(databaseUrl);
-      if (!skipSetName) {
-        await client.client('SETNAME', 'dbgate');
+      if (forDumper) {
+        // URL query parameters take precedence in ioredis; keep dump safety options authoritative.
+        const url = new URL(databaseUrl);
+        for (const name of Object.keys(dumperOptions)) url.searchParams.delete(name);
+        databaseUrl = url.toString();
       }
+      client = new Redis(databaseUrl, { ...protocolOptions, ...dumperOptions });
     } else if (authType === 'cluster' && isProApp && isProApp()) {
       const redisOptions = {
+        ...protocolOptions,
         user,
         password,
       };
@@ -182,11 +355,24 @@ const driver = {
         password,
         db,
         tls: ssl,
+        ...protocolOptions,
+        ...dumperOptions,
       };
       if (!skipSetName) {
         connectionOptions.connectionName = 'dbgate';
       }
       client = new Redis(connectionOptions);
+    }
+
+    try {
+      // With offline queuing disabled, wait until authentication and database selection finish.
+      if (forDumper) await client.connect();
+      if (useDatabaseUrl && !skipSetName) {
+        await client.client('SETNAME', 'dbgate');
+      }
+    } catch (error) {
+      client.disconnect();
+      throw error;
     }
 
     return {
@@ -304,18 +490,33 @@ const driver = {
     return resLimited;
   },
 
-  async exportKeys(dbhan, options) {
-    const dump = new RedisDump({ client: dbhan.client });
-    return new Promise((resolve, reject) => {
-      dump.export({
-        type: 'redis',
-        keyPrefix: options.keyPrefix,
-        callback: (err, data) => {
-          if (err) reject(err);
-          else resolve(data);
-        },
-      });
+  async exportKeys(dbhan, options = {}) {
+    if (dbhan.client instanceof Redis.Cluster) {
+      throw new Error('DBGM-00000 Redis script generation does not support cluster connections');
+    }
+    // Keep the interactive connection usable and export its currently selected database.
+    const client = dbhan.client.duplicate({
+      ...dumperConnectionOptions,
+      db: dbhan.client.condition?.select ?? dbhan.client.options.db ?? 0,
     });
+    let dumperConnection = null;
+    try {
+      await client.connect();
+      dumperConnection = fromIoredis(client);
+      const output = new BufferDumpWriter();
+      await dumpRedis(
+        dumperConnection,
+        {
+          ...getRedisDumpOptions(),
+          ...(options.keyPrefix ? { selection: { match: `${options.keyPrefix}*` } } : {}),
+        },
+        output
+      );
+      return output.toString();
+    } finally {
+      dumperConnection?.detach();
+      await client.quit().catch(() => client.disconnect());
+    }
   },
 
   async getKeys(dbhan, keyQuery = '*') {
@@ -422,14 +623,19 @@ const driver = {
       switch (item.type) {
         case 'list':
           cardinalityPipeline.llen(item.key);
+          break;
         case 'set':
           cardinalityPipeline.scard(item.key);
+          break;
         case 'zset':
           cardinalityPipeline.zcard(item.key);
+          break;
         case 'stream':
           cardinalityPipeline.xlen(item.key);
+          break;
         case 'hash':
           cardinalityPipeline.hlen(item.key);
+          break;
       }
     }
     const resultCardinality = await cardinalityPipeline.exec();
@@ -444,8 +650,8 @@ const driver = {
       ) {
         if (resultCardinality[resIndex][0] == null) {
           item.count = resultCardinality[resIndex][1];
-          resIndex++;
         }
+        resIndex++;
       }
     }
   },
@@ -553,8 +759,14 @@ const driver = {
         let newCursor = 0;
         if (res.length > 0) {
           const id = res[res.length - 1][0];
-          const idParts = id.split('-');
-          newCursor = `${idParts[0]}-${parseInt(idParts[1] + 1)}`;
+          const [timestamp, sequence] = id.split('-').map(BigInt);
+          const maxIdPart = 18446744073709551615n;
+          // Keep inclusive XRANGE cursors compatible with Redis versions before 6.2.
+          if (sequence < maxIdPart) {
+            newCursor = `${timestamp}-${sequence + 1n}`;
+          } else if (timestamp < maxIdPart) {
+            newCursor = `${timestamp + 1n}-0`;
+          }
         }
         return {
           cursor: newCursor,

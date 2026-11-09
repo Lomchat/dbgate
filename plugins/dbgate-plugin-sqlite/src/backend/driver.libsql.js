@@ -5,6 +5,8 @@ const driverBases = require('../frontend/drivers');
 const Analyser = require('./Analyser');
 const { splitQuery, sqliteSplitterOptions } = require('dbgate-query-splitter');
 const { runStreamItem, waitForDrain, modifyRow } = require('./helpers');
+const createLibsqlDumperConnection = require('./libsqlDumperConnection');
+const { backupWithSqliteDumper, restoreWithSqliteDumper } = require('./sqliteDumperOperations');
 const { getLogger, createBulkInsertStreamBase, extractErrorLogData } = global.DBGATE_PACKAGES['dbgate-tools'];
 
 const logger = getLogger('sqliteDriver');
@@ -24,6 +26,17 @@ function extractColumns(row) {
   return columns;
 }
 
+/**
+ * Built-in backup and restore is offered only for libSQL database files. Over a URL every statement
+ * is a network round trip and the read snapshot and transactions the dumper relies on are not
+ * guaranteed, so remote databases are not supported yet.
+ */
+function assertLocalLibsqlConnection(connection) {
+  if (!connection.databaseFile) {
+    throw new Error('DBGM-00000 Built-in backup and restore is available only for libSQL database files, not URLs');
+  }
+}
+
 /** @type {import('dbgate-types').EngineDriver<import('libsql').Database>} */
 const libsqlDriver = {
   ...driverBases[1],
@@ -33,6 +46,7 @@ const libsqlDriver = {
     const client = databaseFile
       ? new Database(databaseFile, { readonly: !!isReadOnly })
       : new Database(databaseUrl, { authToken, readonly: !!isReadOnly });
+    client.defaultSafeIntegers(true);
 
     return {
       client,
@@ -41,6 +55,20 @@ const libsqlDriver = {
   async close(dbhan) {
     // sqlite close is sync, returns this
     dbhan.client.close();
+  },
+  async backupDatabase(connection, settings, runner) {
+    assertLocalLibsqlConnection(connection);
+    return backupWithSqliteDumper(this, connection, settings, runner, {
+      product: 'LibSQL',
+      createDumperConnection: createLibsqlDumperConnection,
+    });
+  },
+  async restoreDatabase(connection, settings, runner) {
+    assertLocalLibsqlConnection(connection);
+    return restoreWithSqliteDumper(this, connection, settings, runner, {
+      product: 'LibSQL',
+      createDumperConnection: createLibsqlDumperConnection,
+    });
   },
   // @ts-ignore
   async query(dbhan, sql) {
@@ -55,6 +83,9 @@ const libsqlDriver = {
       columns: columns.map((col) => ({
         columnName: col.name,
         dataType: col.type,
+        tableName: col.table || undefined,
+        tableSchema: col.database || undefined,
+        sourceColumnName: col.column || undefined,
       })),
     };
   },
@@ -141,6 +172,9 @@ const libsqlDriver = {
         columns: columns.map((col) => ({
           columnName: col.name,
           dataType: col.type,
+          tableName: col.table || undefined,
+          tableSchema: col.database || undefined,
+          sourceColumnName: col.column || undefined,
         })),
       }),
     });

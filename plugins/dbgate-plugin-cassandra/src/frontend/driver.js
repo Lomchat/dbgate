@@ -73,7 +73,7 @@ const dialect = {
   },
 
   quoteIdentifier(s) {
-    return `"${s}"`;
+    return `"${String(s).replace(/"/g, '""')}"`;
   },
 };
 
@@ -87,6 +87,7 @@ const driver = {
   dialect,
   engine: 'cassandra@dbgate-plugin-cassandra',
   title: 'Cassandra',
+  supportsEditableQueryResults: false,
   icon: cassandraIcon,
   showConnectionField: (field, values) =>
     ['server', 'singleDatabase', 'localDataCenter', 'isReadOnly', 'user', 'password', 'allowedDatabases', 'allowedDatabasesRegex'].includes(field),

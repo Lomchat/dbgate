@@ -90,6 +90,19 @@ const databaseListLoader = ({ conid }) => ({
   errorValue: [],
 });
 
+const serverChatDatabaseListLoader = ({ conid, filter }) => ({
+  url: 'server-connections/chat-databases',
+  params: { conid, filter },
+  reloadTrigger: { key: `database-list-changed`, conid },
+});
+
+const serverChatDatabaseStructureLoader = ({ conid, database }) => ({
+  url: 'server-connections/database-structure',
+  params: { conid, database },
+  reloadTrigger: { key: `database-structure-changed`, conid, database },
+  transform: value => (!value || value.errorMessage ? value : extendDatabaseInfo(value)),
+});
+
 const restApiInfoLoader = ({ conid }) => ({
   url: 'rest-connections/get-api-info',
   params: { conid },
@@ -265,6 +278,7 @@ function useCore(loader, args) {
         }
       }
       openedCount += 1;
+      onChange(getCachedValue(cacheKey));
       handleReload();
 
       if (reloadTrigger) {
@@ -417,6 +431,14 @@ export function getDatabaseList(args) {
 }
 export function useDatabaseList(args) {
   return useCore(databaseListLoader, args);
+}
+
+export function getServerChatDatabaseList(args) {
+  return getCore(serverChatDatabaseListLoader, args);
+}
+
+export function getServerChatDatabaseStructure(args) {
+  return getCore(serverChatDatabaseStructureLoader, args);
 }
 
 export function getServerVersion(args) {

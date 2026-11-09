@@ -97,6 +97,8 @@ describe('Data browser data', () => {
     cy.testid('DataFilterControl_filtermenu_ArtistId').click();
     cy.themeshot('data-browser-filter');
     cy.testid('DataGridCore_button_clearFilters').click();
+    cy.testid('DataFilterControl_input_Title').should('have.value', '');
+    cy.testid('DataFilterControl_input_AlbumId').should('have.value', '');
     cy.contains('Rows: 347');
   });
 
@@ -204,6 +206,48 @@ describe('Data browser data', () => {
     cy.themeshot('query-editor-join-wizard');
   });
 
+  it('Edit MySQL query result', () => {
+    const originalTitle = 'For Those About To Rock We Salute You';
+    const changedTitle = 'New Album Title';
+
+    cy.contains('MySql-connection').click();
+    cy.contains('MyChinook').click();
+
+    cy.testid('TabsPanel_buttonNewObject').click();
+    cy.testid('NewObjectModal_query').click();
+    cy.wait(1000);
+    cy.get('body').realType(`UPDATE Album SET Title = '${originalTitle}' WHERE AlbumId = 1`);
+    cy.testid('QueryTab_executeButton').click();
+    cy.contains('Query execution finished');
+
+    cy.testid('TabsPanel_buttonNewObject').click();
+    cy.testid('NewObjectModal_query').click();
+    cy.wait(1000);
+    cy.get('body').realType('select AlbumId, Title, ArtistId from Album where AlbumId <= 10');
+    cy.testid('QueryTab_executeButton').click();
+    cy.contains(originalTitle);
+
+    cy.get('[data-row="0"][data-col="1"]').contains(originalTitle).click();
+    cy.get('[data-row="0"][data-col="1"]').click();
+    cy.get('body').realType(`${changedTitle}{enter}`);
+    cy.themeshot('edit-query-result');
+    cy.testid('ResultTabs_saveResult').click();
+    cy.contains('UPDATE `Album`');
+    cy.contains(`SET \`Title\`='${changedTitle}'`);
+    cy.testid('ConfirmSqlModal_runAgainAfterSave').click();
+    cy.testid('ConfirmSqlModal_okButton').click();
+    cy.contains(changedTitle);
+
+    cy.get('[data-row="0"][data-col="1"]').contains(changedTitle).click();
+    cy.get('[data-row="0"][data-col="1"]').click();
+    cy.get('body').realType(`${originalTitle}{enter}`);
+    cy.testid('ResultTabs_saveResult').click();
+    cy.contains(`SET \`Title\`='${originalTitle}'`);
+    cy.testid('ConfirmSqlModal_runAgainAfterSave').click();
+    cy.testid('ConfirmSqlModal_okButton').click();
+    cy.contains(originalTitle);
+  });
+
   it('Mongo query JSON data view', () => {
     cy.contains('Mongo-connection').click();
     cy.contains('MgChinook').click();
@@ -215,7 +259,7 @@ describe('Data browser data', () => {
     cy.contains('Open query').click();
     cy.wait(1000);
     cy.contains('Execute').click();
-    cy.testid('TabContent_1').contains('Leonie').rightclick();
+    cy.testid('TabContent_1').contains('Leonie', { timeout: 30000 }).rightclick();
     cy.contains('Show cell data').click();
     // test JSON view
     cy.contains('Country: "Germany"');

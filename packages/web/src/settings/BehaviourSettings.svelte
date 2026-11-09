@@ -24,6 +24,13 @@
       disabled={values['behaviour.useTabPreviewMode'] === false}
     />
 
+    <FormCheckboxField
+      name="behaviour.useDiagnosticTools"
+      label={_t('settings.behaviour.useDiagnosticTools', { defaultMessage: 'Use diagnostic tools' })}
+      defaultValue={false}
+      data-testid="BehaviourSettings_useDiagnosticTools"
+    />
+
     <div class="heading">{_t('settings.tabPreviewMode', { defaultMessage: 'Tab Preview Mode' })}</div>
 
     <div class="tip">
@@ -53,6 +60,12 @@
       name="skipConfirm.collectionDataSave"
       label={_t('settings.confirmations.skipConfirm.collectionDataSave', {
         defaultMessage: 'Skip confirmation when saving collection data (NoSQL)',
+      })}
+    />
+    <FormCheckboxField
+      name="dataGrid.skipFetchAllConfirm"
+      label={_t('settings.confirmations.skipFetchAllConfirm', {
+        defaultMessage: 'Skip confirmation when fetching all rows',
       })}
     />
   </FormValues>

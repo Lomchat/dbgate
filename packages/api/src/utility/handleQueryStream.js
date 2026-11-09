@@ -4,9 +4,12 @@ const fs = require('fs');
 const _ = require('lodash');
 
 const { jsldir } = require('../utility/directories');
-const { serializeJsTypesReplacer } = require('dbgate-tools');
+const { serializeJsTypesReplacer, getLogger, extractErrorMessage } = require('dbgate-tools');
 const { ChartProcessor } = require('dbgate-datalib');
 const { isProApp } = require('./checkLicense');
+const { enrichQueryResultColumns } = require('./queryResultMetadata');
+
+const logger = getLogger('handleQueryStream');
 
 class QueryStreamTableWriter {
   constructor(sesid = undefined) {
@@ -46,6 +49,8 @@ class QueryStreamTableWriter {
 
   row(row) {
     // console.log('ACCEPT ROW', row);
+    // close() nulls currentStream; drivers can still deliver rows after that
+    if (!this.currentStream) return;
     this.currentStream.write(JSON.stringify(row, serializeJsTypesReplacer) + '\n');
     try {
       if (this.chartProcessor) {
@@ -98,7 +103,8 @@ class QueryStreamTableWriter {
   }
 
   close(afterClose) {
-    return new Promise(resolve => {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = new Promise(resolve => {
       if (this.currentStream) {
         this.currentStream.end(() => {
           this.writeCurrentStats(true, true);
@@ -132,7 +138,11 @@ class QueryStreamTableWriter {
       } else {
         resolve();
       }
+    }).finally(() => {
+      this.currentStream = null;
+      this.chartProcessor = null;
     });
+    return this.closePromise;
   }
 }
 
@@ -144,13 +154,21 @@ class StreamHandler {
     sesid = undefined,
     limitRows = undefined,
     frontMatter = undefined,
-    autoDetectCharts = false
+    autoDetectCharts = false,
+    supportsEditableQueryResults = false,
+    dbhan = null,
+    driver = null,
+    dbinfo = null
   ) {
     this.recordset = this.recordset.bind(this);
     this.startLine = startLine;
     this.sesid = sesid;
     this.frontMatter = frontMatter;
     this.autoDetectCharts = autoDetectCharts;
+    this.supportsEditableQueryResults = supportsEditableQueryResults;
+    this.dbhan = dbhan;
+    this.driver = driver;
+    this.dbinfo = dbinfo;
     this.limitRows = limitRows;
     this.rowsLimitOverflow = false;
     this.row = this.row.bind(this);
@@ -165,14 +183,20 @@ class StreamHandler {
     this.plannedStats = false;
     this.queryStreamInfoHolder = queryStreamInfoHolder;
     this.resolve = resolve;
-    this.rowCounter = 0;
+    this.finished = false;
+    this.currentRecordset = null;
+    this.recordsetQueuePromise = Promise.resolve();
     // currentHandlers = [...currentHandlers, this];
   }
 
-  closeCurrentWriter() {
+  async closeCurrentWriter() {
     if (this.currentWriter) {
-      this.currentWriter.close();
-      this.currentWriter = null;
+      const writer = this.currentWriter;
+      try {
+        await writer.close();
+      } finally {
+        this.currentWriter = null;
+      }
     }
   }
 
@@ -180,21 +204,37 @@ class StreamHandler {
     process.send({ msgtype: 'changedCurrentDatabase', database, sesid: this.sesid });
   }
 
-  recordset(columns, options) {
+  async prepareRecordset(recordsetContext, columns, options) {
     if (this.rowsLimitOverflow) {
       return;
     }
-    this.closeCurrentWriter();
-    this.currentWriter = new QueryStreamTableWriter(this.sesid);
-    this.currentWriter.initializeFromQuery(
-      Array.isArray(columns) ? { columns } : columns,
-      this.queryStreamInfoHolder.resultIndex,
-      this.frontMatter?.[`chart-${this.queryStreamInfoHolder.resultIndex + 1}`],
+    await this.closeCurrentWriter();
+    const writer = new QueryStreamTableWriter(this.sesid);
+    const structure = Array.isArray(columns) ? { columns } : columns;
+    const enrichedColumns = await enrichQueryStreamColumns(
+      structure?.columns,
+      this.sql,
+      this.supportsEditableQueryResults,
+      this.driver,
+      this.dbhan,
+      this.dbinfo
+    );
+    writer.initializeFromQuery(
+      {
+        ...structure,
+        columns: enrichedColumns,
+      },
+      recordsetContext.resultIndex,
+      this.frontMatter?.[`chart-${recordsetContext.resultIndex + 1}`],
       this.autoDetectCharts,
       options
     );
-    this.queryStreamInfoHolder.resultIndex += 1;
-    this.rowCounter = 0;
+    recordsetContext.writer = writer;
+    this.currentWriter = writer;
+    for (const row of recordsetContext.pendingRows) {
+      this.writeRow(recordsetContext, row, false);
+    }
+    recordsetContext.pendingRows = [];
 
     // this.writeCurrentStats();
 
@@ -204,15 +244,53 @@ class StreamHandler {
     //   }
     // }, 500);
   }
+
+  recordset(columns, options) {
+    if (this.finished) {
+      return;
+    }
+    const recordsetContext = {
+      pendingRows: [],
+      resultIndex: this.queryStreamInfoHolder.resultIndex,
+      rowCounter: 0,
+      writer: null,
+    };
+    this.queryStreamInfoHolder.resultIndex += 1;
+    this.currentRecordset = recordsetContext;
+
+    const recordsetReadyPromise = this.recordsetQueuePromise
+      .then(() => this.prepareRecordset(recordsetContext, columns, options))
+      .catch(err => {
+        recordsetContext.pendingRows = [];
+        this.info({
+          message: err?.message || `${err}`,
+          severity: 'error',
+        });
+      })
+      .finally(() => {
+        if (this.recordsetReadyPromise == recordsetReadyPromise) {
+          this.recordsetReadyPromise = null;
+        }
+      });
+    this.recordsetReadyPromise = recordsetReadyPromise;
+    this.recordsetQueuePromise = recordsetReadyPromise;
+  }
+
+  writeRow(recordsetContext, row, incrementCounter = true) {
+    recordsetContext.writer.row(row);
+    if (incrementCounter) recordsetContext.rowCounter += 1;
+  }
+
   row(row) {
-    if (this.rowsLimitOverflow) {
+    if (this.finished || this.rowsLimitOverflow) {
       return;
     }
 
-    if (this.limitRows && this.rowCounter >= this.limitRows) {
+    const recordsetContext = this.currentRecordset;
+    if (this.limitRows && recordsetContext?.rowCounter >= this.limitRows) {
       process.send({
         msgtype: 'info',
-        info: { message: `Rows limit overflow, loaded ${this.rowCounter} rows, canceling query`, severity: 'error' },
+        info: { message: `Rows limit overflow, loaded ${recordsetContext.rowCounter} rows, canceling query`, severity: 'error' },
         sesid: this.sesid,
       });
       this.rowsLimitOverflow = true;
@@ -229,9 +307,11 @@ class StreamHandler {
       return;
     }
 
-    if (this.currentWriter) {
-      this.currentWriter.row(row);
-      this.rowCounter += 1;
+    if (recordsetContext?.writer) {
+      this.writeRow(recordsetContext, row);
+    } else if (recordsetContext) {
+      recordsetContext.pendingRows.push(row);
+      recordsetContext.rowCounter += 1;
     } else if (row.message) {
       process.send({ msgtype: 'info', info: { message: row.message }, sesid: this.sesid });
     }
@@ -240,10 +320,36 @@ class StreamHandler {
   // error(error) {
   //   process.send({ msgtype: 'error', error });
   // }
-  done(result) {
-    this.closeCurrentWriter();
-    // currentHandlers = currentHandlers.filter((x) => x != this);
-    this.resolve();
+  done(result, error = null) {
+    if (this.finishPromise) return this.finishPromise;
+    this.finished = true;
+    this.finishPromise = (async () => {
+      const resolve = this.resolve;
+      try {
+        await this.recordsetQueuePromise;
+        await this.closeCurrentWriter();
+      } catch (err) {
+        error = error || err;
+      } finally {
+        // Release metadata and the last result writer even if a driver retains its callbacks.
+        this.currentRecordset = null;
+        this.recordsetReadyPromise = null;
+        this.recordsetQueuePromise = Promise.resolve();
+        this.dbhan = null;
+        this.driver = null;
+        this.dbinfo = null;
+        this.sql = null;
+        this.frontMatter = null;
+        this.resolve = null;
+      }
+      if (error) {
+        // Report the error through the info channel (which also sets canceled), so that the caller
+        // still sends its 'done' message and the query does not stay in executing state forever.
+        this.info({ message: extractErrorMessage(error), severity: 'error' });
+      }
+      resolve();
+    })();
+    return this.finishPromise;
   }
   info(info) {
     if (info && info.line != null) {
@@ -259,6 +365,19 @@ class StreamHandler {
   }
 }
 
+async function enrichQueryStreamColumns(columns, sql, supportsEditableQueryResults, driver, dbhan, dbinfo) {
+  if (!supportsEditableQueryResults) return columns;
+  return enrichQueryResultColumns({
+    columns,
+    sql,
+    driver,
+    dbhan,
+    dbinfo,
+    onNativeMetadataError: err => logger.warn('Error enriching query stream columns', err),
+    onFallbackMetadataError: err => logger.warn('Error parsing query stream column metadata', err),
+  });
+}
+
 function handleQueryStream(
   dbhan,
   driver,
@@ -267,9 +386,10 @@ function handleQueryStream(
   sesid = undefined,
   limitRows = undefined,
   frontMatter = undefined,
-  autoDetectCharts = false
+  autoDetectCharts = false,
+  dbinfo = null
 ) {
-  return new Promise((resolve, reject) => {
+  return new Promise(resolve => {
     const start = sqlItem.trimStart || sqlItem.start;
     const handler = new StreamHandler(
       queryStreamInfoHolder,
@@ -278,9 +398,18 @@ function handleQueryStream(
       sesid,
       limitRows,
       frontMatter,
-      autoDetectCharts
+      autoDetectCharts,
+      driver.databaseEngineTypes?.includes('sql') && driver.supportsEditableQueryResults,
+      dbhan,
+      driver,
+      dbinfo
     );
-    driver.stream(dbhan, sqlItem.text, handler);
+    handler.sql = sqlItem.text;
+    try {
+      Promise.resolve(driver.stream(dbhan, sqlItem.text, handler)).catch(err => handler.done(null, err));
+    } catch (err) {
+      handler.done(null, err);
+    }
   });
 }
 

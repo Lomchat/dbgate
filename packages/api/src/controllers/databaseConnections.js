@@ -15,6 +15,7 @@ const {
   getLogger,
   extractErrorLogData,
   filterStructureBySchema,
+  isCompositeDbName,
   serializeJsTypesForJsonStringify,
 } = require('dbgate-tools');
 const { html, parse } = require('diff2html');
@@ -40,6 +41,7 @@ const {
   getDatabasePermissionRole,
   getTablePermissionRoleLevelIndex,
   testDatabaseRolePermission,
+  testStandardPermission,
 } = require('../utility/hasPermission');
 const { MissingCredentialsError } = require('../utility/exceptions');
 const pipeForkLogs = require('../utility/pipeForkLogs');
@@ -49,12 +51,56 @@ const exportDbModelSql = require('../utility/exportDbModelSql');
 const axios = require('axios');
 const { callTextToSqlApi, callCompleteOnCursorApi, callRefactorSqlQueryApi } = require('../utility/authProxy');
 const { decryptConnection } = require('../utility/crypting');
+const platformInfo = require('../utility/platformInfo');
+const {
+  checkSecureExportFilePath,
+  checkSecureSqlDumpFilePath,
+  writeExportFile,
+  SecureExportWriteRefusedError,
+  isValidRunId,
+} = require('../utility/security');
+const { checkJsonScriptAccess } = require('../utility/jsonScriptAccess');
 const { getSshTunnel } = require('../utility/sshTunnel');
 const sessions = require('./sessions');
 const jsldata = require('./jsldata');
 const { sendToAuditLog } = require('../utility/auditlog');
+const {
+  extractConnectionSslParams,
+  decryptCloudConnection,
+  createConnectionHttpClient,
+} = require('../utility/connectUtility');
 
 const logger = getLogger('databaseConnections');
+
+function getRestoreUploadPath(inputFile, inputUploadName) {
+  if (
+    !inputFile ||
+    !inputUploadName ||
+    path.basename(inputUploadName) != inputUploadName ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(inputUploadName)
+  ) {
+    return null;
+  }
+
+  const uploadPath = path.join(uploadsdir(), inputUploadName);
+  return path.resolve(inputFile) == path.resolve(uploadPath) ? uploadPath : null;
+}
+
+// The command line copied from the backup/restore tabs is shown to the user, who may be allowed to
+// use the connection without being allowed to see its password (eg. mysqldump --password=...)
+function maskPasswordInCommandLine(commandLine, password) {
+  if (platformInfo.isElectron || !password) return commandLine;
+  return commandLine.split(password).join('***');
+}
+
+function removeRestoreUpload(uploadPath) {
+  if (!uploadPath) return;
+  fs.unlink(uploadPath).catch(error => {
+    if (error.code != 'ENOENT') {
+      logger.warn(extractErrorLogData(error), 'DBGM-00248 Error removing temporary restore upload');
+    }
+  });
+}
 
 module.exports = {
   /** @type {import('dbgate-types').OpenedDatabaseConnection[]} */
@@ -124,13 +170,13 @@ module.exports = {
 
   handle_done(conid, database, props) {
     const { sesid } = props;
-    socket.emit(`session-done-${sesid}`);
+    socket.emitOwned(socket.sessionOwnerKey(sesid), `session-done-${sesid}`);
     sessions.dispatchMessage(sesid, 'Query execution finished');
   },
 
   handle_recordset(conid, database, props) {
     const { jslid, resultIndex } = props;
-    socket.emit(`session-recordset-${props.sesid}`, { jslid, resultIndex });
+    socket.emitOwned(socket.sessionOwnerKey(props.sesid), `session-recordset-${props.sesid}`, { jslid, resultIndex });
   },
 
   handle_stats(conid, database, stats) {
@@ -138,27 +184,34 @@ module.exports = {
   },
 
   handle_initializeFile(conid, database, props) {
-    const { jslid } = props;
-    socket.emit(`session-initialize-file-${jslid}`);
+    const { jslid, sesid } = props;
+    socket.emitOwned(socket.sessionOwnerKey(sesid), `session-initialize-file-${jslid}`);
   },
 
   // eval event handler
   handle_runnerDone(conid, database, props) {
     const { runid } = props;
-    socket.emit(`runner-done-${runid}`);
+    socket.emitOwned(socket.runnerOwnerKey(runid), `runner-done-${runid}`);
   },
 
   handle_progress(conid, database, progressData) {
     const { progressName } = progressData;
     const { name, runid } = progressName;
-    socket.emit(`runner-progress-${runid}`, { ...progressData, progressName: name });
+    socket.emitOwned(socket.runnerOwnerKey(runid), `runner-progress-${runid}`, { ...progressData, progressName: name });
   },
 
   handle_copyStreamError(conid, database, { copyStreamError }) {
     const { progressName } = copyStreamError;
-    const { runid } = progressName;
-    logger.error(`DBGM-00103 Error in database connection ${conid}, database ${database}: ${copyStreamError}`);
-    socket.emit(`runner-done-${runid}`);
+    const runid = progressName?.runid;
+    logger.error({ conid, database, copyStreamError }, 'DBGM-00249 Error in database connection copy stream');
+    if (!runid) return;
+    if (copyStreamError.dbgateCopyStreamErrorReported) return;
+    socket.emitOwned(socket.runnerOwnerKey(runid), `runner-progress-${runid}`, {
+      progressName: progressName?.name,
+      status: 'error',
+      errorMessage: copyStreamError.message,
+    });
+    socket.emitOwned(socket.runnerOwnerKey(runid), `runner-done-${runid}`);
   },
 
   async ensureOpened(conid, database) {
@@ -179,6 +232,7 @@ module.exports = {
     if (connection.useRedirectDbLogin) {
       throw new MissingCredentialsError({ conid, redirectToDbLogin: true });
     }
+    const globalSettings = await config.getSettings();
     const subprocess = fork(
       global['API_PACKAGE'] || process.argv[1],
       [
@@ -189,11 +243,17 @@ module.exports = {
         // ...process.argv.slice(3),
       ],
       {
+        env: {
+          ...process.env,
+          NODE_NO_WARNINGS: globalSettings?.['behaviour.useDiagnosticTools'] === true ? '0' : '1',
+        },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       }
     );
     pipeForkLogs(subprocess);
     const lastClosed = this.closed[`${conid}/${database}`];
+    const initialStatusName =
+      !lastClosed && !(connection.useSeparateSchemas && !isCompositeDbName(database)) ? 'loadStructure' : 'pending';
     const newOpened = {
       conid,
       database,
@@ -201,7 +261,7 @@ module.exports = {
       structure: lastClosed ? lastClosed.structure : DatabaseAnalyser.createEmptyStructure(),
       serverVersion: lastClosed ? lastClosed.serverVersion : null,
       connection,
-      status: { name: 'pending' },
+      status: { name: initialStatusName },
     };
     this.opened.push(newOpened);
     subprocess.on('message', message => {
@@ -231,10 +291,19 @@ module.exports = {
       msgtype: 'connect',
       connection: { ...connection, database },
       structure: lastClosed ? lastClosed.structure : null,
-      globalSettings: await config.getSettings(),
+      globalSettings,
     });
     subprocess.send(connectMessage);
     return newOpened;
+  },
+
+  async ensureStructureLoaded(conid, database) {
+    const conn = await this.ensureOpened(conid, database);
+    if (conn.isApiConnection || !conn.subprocess) {
+      return conn.structure ?? {};
+    }
+    const response = await this.sendRequest(conn, { msgtype: 'getStructure' });
+    return response.structure ?? conn.structure ?? {};
   },
 
   /** @param {import('dbgate-types').OpenedDatabaseConnection} conn */
@@ -253,6 +322,14 @@ module.exports = {
     return promise;
   },
 
+  // runs any SQL from the client (the AI agent's SQL tool), like sessions/execute-query
+  queryData_access: {
+    permission: 'dbops/query',
+    connection: 'conid',
+    database: 'database',
+    databaseRole: 'run_script',
+  },
+
   queryData_meta: true,
   async queryData({ conid, database, sql }, req) {
     await testConnectionPermission(conid, req);
@@ -264,6 +341,13 @@ module.exports = {
     const res = await this.sendRequest(opened, { msgtype: 'queryData', sql });
     return res;
   },
+
+  async queryServerChatData({ conid, database, sql }) {
+    const opened = await this.ensureOpened(conid, database);
+    return this.sendRequest(opened, { msgtype: 'serverChatQueryData', sql });
+  },
+
+  sqlSelect_access: 'self',
 
   sqlSelect_meta: true,
   async sqlSelect({ conid, database, select, commandTimeout, auditLogSessionGroup }, req) {
@@ -300,6 +384,8 @@ module.exports = {
     return res;
   },
 
+  runScript_access: 'self',
+
   runScript_meta: true,
   async runScript({ conid, database, sql, useTransaction, logMessage }, req) {
     const loadedPermissions = await loadPermissionsFromRequest(req);
@@ -323,6 +409,8 @@ module.exports = {
     return res;
   },
 
+  runOperation_access: { connection: 'conid', database: 'database', databaseRole: 'run_script' },
+
   runOperation_meta: true,
   async runOperation({ conid, database, operation, useTransaction }, req) {
     await testConnectionPermission(conid, req);
@@ -344,6 +432,8 @@ module.exports = {
     const res = await this.sendRequest(opened, { msgtype: 'runOperation', operation, useTransaction });
     return res;
   },
+
+  collectionData_access: 'self',
 
   collectionData_meta: true,
   async collectionData({ conid, database, options, commandTimeout, auditLogSessionGroup }, req) {
@@ -394,11 +484,15 @@ module.exports = {
     return res.result || null;
   },
 
+  schemaList_access: { connection: 'conid', database: 'database', databaseRole: 'view' },
+
   schemaList_meta: true,
   async schemaList({ conid, database }, req) {
     await testConnectionPermission(conid, req);
     return this.loadDataCore('schemaList', { conid, database });
   },
+
+  dispatchDatabaseChangedEvent_access: { connection: 'conid' },
 
   dispatchDatabaseChangedEvent_meta: true,
   dispatchDatabaseChangedEvent({ event, conid, database }) {
@@ -406,11 +500,15 @@ module.exports = {
     return null;
   },
 
+  dispatchRedisKeysChanged_access: { connection: 'conid' },
+
   dispatchRedisKeysChanged_meta: true,
   dispatchRedisKeysChanged({ conid, database }) {
     socket.emit(`redis-keys-changed-${conid}-${database}`);
     return null;
   },
+
+  loadKeys_access: { connection: 'conid', database: 'database', databaseRole: 'view' },
 
   loadKeys_meta: true,
   async loadKeys({ conid, database, root, filter, limit }, req) {
@@ -418,11 +516,15 @@ module.exports = {
     return this.loadDataCore('loadKeys', { conid, database, root, filter, limit });
   },
 
+  scanKeys_access: { connection: 'conid', database: 'database', databaseRole: 'view' },
+
   scanKeys_meta: true,
   async scanKeys({ conid, database, root, pattern, cursor, count }, req) {
     await testConnectionPermission(conid, req);
     return this.loadDataCore('scanKeys', { conid, database, root, pattern, cursor, count });
   },
+
+  exportKeys_access: { connection: 'conid', database: 'database', databaseRole: 'read_content' },
 
   exportKeys_meta: true,
   async exportKeys({ conid, database, options }, req) {
@@ -430,11 +532,15 @@ module.exports = {
     return this.loadDataCore('exportKeys', { conid, database, options });
   },
 
+  loadKeyInfo_access: { connection: 'conid', database: 'database', databaseRole: 'read_content' },
+
   loadKeyInfo_meta: true,
   async loadKeyInfo({ conid, database, key }, req) {
     await testConnectionPermission(conid, req);
     return this.loadDataCore('loadKeyInfo', { conid, database, key });
   },
+
+  loadKeyTableRange_access: { connection: 'conid', database: 'database', databaseRole: 'read_content' },
 
   loadKeyTableRange_meta: true,
   async loadKeyTableRange({ conid, database, key, cursor, count }, req) {
@@ -442,11 +548,15 @@ module.exports = {
     return this.loadDataCore('loadKeyTableRange', { conid, database, key, cursor, count });
   },
 
+  loadFieldValues_access: 'self',
+
   loadFieldValues_meta: true,
   async loadFieldValues({ conid, database, schemaName, pureName, field, search, dataType }, req) {
     await testConnectionPermission(conid, req);
     return this.loadDataCore('loadFieldValues', { conid, database, schemaName, pureName, field, search, dataType });
   },
+
+  callMethod_access: { connection: 'conid', database: 'database', databaseRole: 'write_data' },
 
   callMethod_meta: true,
   async callMethod({ conid, database, method, args }, req) {
@@ -461,6 +571,8 @@ module.exports = {
     // return res.result || null;
   },
 
+  updateCollection_access: 'self',
+
   updateCollection_meta: true,
   async updateCollection({ conid, database, changeSet }, req) {
     await testConnectionPermission(conid, req);
@@ -474,6 +586,8 @@ module.exports = {
     }
     return res.result || null;
   },
+
+  saveTableData_access: 'self',
 
   saveTableData_meta: true,
   async saveTableData({ conid, database, changeSet }, req) {
@@ -514,6 +628,25 @@ module.exports = {
     return res.result || null;
   },
 
+  saveQueryResultData_access: 'self',
+
+  saveQueryResultData_meta: true,
+  async saveQueryResultData({ conid, database, changeSet, sql }, req) {
+    await testConnectionPermission(conid, req);
+    await testDatabaseRolePermission(conid, database, 'run_script', req);
+
+    const opened = await this.ensureOpened(conid, database);
+    const res = await this.sendRequest(opened, { msgtype: 'saveQueryResultData', changeSet, sql });
+    if (res.errorMessage) {
+      return {
+        errorMessage: res.errorMessage,
+      };
+    }
+    return res.result || { state: 'ok' };
+  },
+
+  multiCallMethod_access: { connection: 'conid', database: 'database', databaseRole: 'write_data' },
+
   multiCallMethod_meta: true,
   async multiCallMethod({ conid, database, callList }, req) {
     await testConnectionPermission(conid, req);
@@ -527,6 +660,8 @@ module.exports = {
     }
     return res.result || null;
   },
+
+  status_access: 'self',
 
   status_meta: true,
   async status({ conid, database }, req) {
@@ -557,6 +692,8 @@ module.exports = {
     };
   },
 
+  ping_access: 'self',
+
   ping_meta: true,
   async ping({ conid, database }, req) {
     await testConnectionPermission(conid, req);
@@ -585,6 +722,8 @@ module.exports = {
     };
   },
 
+  pingDatabases_access: 'user',
+
   pingDatabases_meta: true,
   async pingDatabases({ databases }, req) {
     if (!databases || !Array.isArray(databases)) return { status: 'ok' };
@@ -603,6 +742,8 @@ module.exports = {
     return { status: 'ok' };
   },
 
+  refresh_access: 'self',
+
   refresh_meta: true,
   async refresh({ conid, database, keepOpen }, req) {
     await testConnectionPermission(conid, req);
@@ -611,6 +752,8 @@ module.exports = {
     await this.ensureOpened(conid, database);
     return { status: 'ok' };
   },
+
+  syncModel_access: 'self',
 
   syncModel_meta: true,
   async syncModel({ conid, database, isFullRefresh }, req) {
@@ -663,12 +806,16 @@ module.exports = {
     }
   },
 
+  disconnect_access: 'self',
+
   disconnect_meta: true,
   async disconnect({ conid, database }, req) {
     await testConnectionPermission(conid, req);
     await this.close(conid, database, true);
     return { status: 'ok' };
   },
+
+  structure_access: 'self',
 
   structure_meta: true,
   async structure({ conid, database, modelTransFile = null }, req) {
@@ -679,6 +826,11 @@ module.exports = {
 
     await testConnectionPermission(conid, req, loadedPermissions);
     if (conid == '__model') {
+      // the model is a folder of YAML/SQL files; in the web app only archive folders, not any
+      // server path (this is also reached from the diff report, without a request)
+      if (!platformInfo.isElectron && !(typeof database == 'string' && database.startsWith('archive:'))) {
+        throw new Error('DBGM-00000 Model must be an archive folder');
+      }
       const model = await importDbModel(database);
       const trans = await loadModelTransform(modelTransFile);
       return trans ? trans(model) : model;
@@ -748,6 +900,8 @@ module.exports = {
     // };
   },
 
+  serverVersion_access: 'self',
+
   serverVersion_meta: true,
   async serverVersion({ conid, database }, req) {
     if (!conid) {
@@ -757,6 +911,13 @@ module.exports = {
     if (!conid) return null;
     const opened = await this.ensureOpened(conid, database);
     return opened.serverVersion || null;
+  },
+
+  sqlPreview_access: {
+    permission: 'dbops/sql-generator',
+    connection: 'conid',
+    database: 'database',
+    databaseRole: 'view',
   },
 
   sqlPreview_meta: true,
@@ -770,9 +931,21 @@ module.exports = {
     return res;
   },
 
+  exportModel_access: {
+    permission: ['dbops/model/view', 'archive/write'],
+    connection: 'conid',
+    database: 'database',
+    databaseRole: 'view',
+  },
+
   exportModel_meta: true,
   async exportModel({ conid, database, outputFolder, schema }, req) {
     await testConnectionPermission(conid, req);
+    // a folder anywhere on the disk can be chosen only in the desktop app; the web app exports
+    // into the archive
+    if (!platformInfo.isElectron && !outputFolder?.startsWith('archive:')) {
+      throw new Error('DBGM-00000 The model can be exported only to an archive folder');
+    }
 
     const realFolder = outputFolder.startsWith('archive:')
       ? resolveArchiveFolder(outputFolder.substring('archive:'.length))
@@ -788,9 +961,21 @@ module.exports = {
     return { status: 'ok' };
   },
 
+  exportModelSql_access: {
+    permission: 'dbops/model/view',
+    connection: 'conid',
+    database: 'database',
+    databaseRole: 'view',
+  },
+
   exportModelSql_meta: true,
   async exportModelSql({ conid, database, outputFolder, outputFile, schema }, req) {
     await testConnectionPermission(conid, req);
+    // in the web app the SQL file is written to the uploads folder and downloaded from there;
+    // folders are chosen only in the desktop app
+    if (!platformInfo.isElectron && (outputFolder || !checkSecureExportFilePath(outputFile))) {
+      throw new Error('DBGM-00000 Refused export write outside managed data directories');
+    }
 
     const connection = await connections.getCore({ conid });
     const driver = requireEngineDriver(connection);
@@ -801,6 +986,8 @@ module.exports = {
 
     return { status: 'ok' };
   },
+
+  generateDeploySql_access: { connection: 'conid', database: 'database', databaseRole: 'view' },
 
   generateDeploySql_meta: true,
   async generateDeploySql({ conid, database, archiveFolder }, req) {
@@ -841,15 +1028,14 @@ module.exports = {
   //   return res;
   // },
 
-  async getUnifiedDiff({ sourceConid, sourceDatabase, targetConid, targetDatabase }) {
+  async getUnifiedDiff({ sourceConid, sourceDatabase, targetConid, targetDatabase }, req) {
     const dbDiffOptions = sourceConid == '__model' ? modelCompareDbDiffOptions : {};
 
-    const sourceDb = generateDbPairingId(
-      extendDatabaseInfo(await this.structure({ conid: sourceConid, database: sourceDatabase }))
-    );
-    const targetDb = generateDbPairingId(
-      extendDatabaseInfo(await this.structure({ conid: targetConid, database: targetDatabase }))
-    );
+    // with the request, structure leaves out the tables the caller may not see (Team Premium);
+    // a model is an archive folder, not a database with permissions
+    const loadStructure = (conid, database) => this.structure({ conid, database }, conid == '__model' ? undefined : req);
+    const sourceDb = generateDbPairingId(extendDatabaseInfo(await loadStructure(sourceConid, sourceDatabase)));
+    const targetDb = generateDbPairingId(extendDatabaseInfo(await loadStructure(targetConid, targetDatabase)));
     // const sourceConnection = await connections.getCore({conid:sourceConid})
     const connection = await connections.getCore({ conid: targetConid });
     const driver = requireEngineDriver(connection);
@@ -876,20 +1062,44 @@ module.exports = {
     return res;
   },
 
+  generateDbDiffReport_access: 'self',
+
   generateDbDiffReport_meta: true,
-  async generateDbDiffReport({ filePath, sourceConid, sourceDatabase, targetConid, targetDatabase }) {
-    const unifiedDiff = await this.getUnifiedDiff({ sourceConid, sourceDatabase, targetConid, targetDatabase });
+  async generateDbDiffReport({ filePath, sourceConid, sourceDatabase, targetConid, targetDatabase }, req) {
+    // the report contains the structure of both databases
+    await testStandardPermission('dbops/model/compare', req);
+    for (const [conid, database] of [
+      [sourceConid, sourceDatabase],
+      [targetConid, targetDatabase],
+    ]) {
+      if (conid == '__model') continue;
+      await testConnectionPermission(conid, req);
+      await testDatabaseRolePermission(conid, database, 'view', req);
+    }
+    if (!platformInfo.isElectron && !checkSecureExportFilePath(filePath)) {
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
+
+    const unifiedDiff = await this.getUnifiedDiff({ sourceConid, sourceDatabase, targetConid, targetDatabase }, req);
 
     const diffJson = parse(unifiedDiff);
     // $: diffHtml = html(diffJson, { outputFormat: 'side-by-side', drawFileList: false });
     const diffHtml = html(diffJson, { outputFormat: 'side-by-side' });
 
-    await fs.writeFile(filePath, diff2htmlPage(diffHtml));
+    try {
+      await writeExportFile(filePath, diff2htmlPage(diffHtml), { noFollow: !platformInfo.isElectron });
+    } catch (err) {
+      if (!(err instanceof SecureExportWriteRefusedError)) throw err;
+      logger.warn({ filePath }, 'DBGM-00000 Refused export write outside managed data directories');
+      return false;
+    }
 
     return true;
   },
 
-  textToSql_meta: true,
+  // Not an API route: nothing calls it, and it checked no permission (it sends the structure of any
+  // opened database to the AI service)
   async textToSql({ conid, database, text, dialect }) {
     const existing = this.opened.find(x => x.conid == conid && x.database == database);
     const { structure } = existing || {};
@@ -904,7 +1114,8 @@ module.exports = {
     return res;
   },
 
-  completeOnCursor_meta: true,
+  // Not an API route: nothing calls it, and it checked no permission (it sends the structure of any
+  // opened database to the AI service)
   async completeOnCursor({ conid, database, text, dialect, line }) {
     const existing = this.opened.find(x => x.conid == conid && x.database == database);
     const { structure } = existing || {};
@@ -918,7 +1129,8 @@ module.exports = {
     return res;
   },
 
-  refactorSqlQuery_meta: true,
+  // Not an API route: nothing calls it, and it checked no permission (it sends the structure of any
+  // opened database to the AI service)
   async refactorSqlQuery({ conid, database, query, task, dialect }) {
     const existing = this.opened.find(x => x.conid == conid && x.database == database);
     const { structure } = existing || {};
@@ -936,34 +1148,10 @@ module.exports = {
     command,
     { conid, database, outputFile, inputFile, options, selectedTables, skippedTables, argsFormat }
   ) {
-    const sourceConnection = await connections.getCore({ conid });
-    const connection = {
-      ...decryptConnection(sourceConnection),
-    };
-    const driver = requireEngineDriver(connection);
-
-    if (!connection.port && driver.defaultPort) {
-      connection.port = driver.defaultPort.toString();
-    }
-
-    if (connection.useSshTunnel) {
-      const tunnel = await getSshTunnel(connection);
-      if (tunnel.state == 'error') {
-        throw new Error(tunnel.message);
-      }
-
-      connection.server = tunnel.localHost;
-      connection.port = tunnel.localPort;
-    }
-
-    const settingsValue = await config.getSettings();
-
-    const externalTools = {};
-    for (const pair of Object.entries(settingsValue || {})) {
-      const [name, value] = pair;
-      if (name.startsWith('externalTools.')) {
-        externalTools[name.substring('externalTools.'.length)] = value;
-      }
+    const { connection, driver, externalTools } = await this.getNativeOpContext(conid);
+    const capability = command == 'backup' ? 'supportsNativeBackup' : 'supportsNativeRestore';
+    if (!driver[capability]) {
+      throw new Error(`DBGM-00250 The selected database driver does not support native ${command}`);
     }
 
     return {
@@ -986,6 +1174,71 @@ module.exports = {
     };
   },
 
+  // Backup dumps the whole database and restore runs the dump against it, both with the
+  // connection's stored credentials. These are the permissions the UI asks for before it offers
+  // either action, plus the database role the operation amounts to.
+  async testNativeOpPermission(command, conid, database, req) {
+    await testConnectionPermission(conid, req);
+    if (command == 'backup') {
+      await testStandardPermission('dbops/sql-dump/export', req);
+      await testDatabaseRolePermission(conid, database, 'read_content', req);
+    } else {
+      await testStandardPermission('dbops/sql-dump/import', req);
+      await testDatabaseRolePermission(conid, database, 'run_script', req);
+      const connection = await connections.getCore({ conid });
+      if (connection?.isReadOnly) {
+        throw new Error('DBGM-00000 Connection is read-only');
+      }
+    }
+  },
+
+  // In the web app the dump file must be in the SQL files folder, or be the upload being restored
+  testNativeOpFilePath(filePath, restoreUploadPath) {
+    if (platformInfo.isElectron || restoreUploadPath) return;
+    if (!checkSecureSqlDumpFilePath(filePath)) {
+      throw new Error('DBGM-00000 The backup file must be in the SQL files folder');
+    }
+  },
+
+  async getNativeOpContext(conid) {
+    const sourceConnection = await connections.getCore({ conid });
+    // Connections stored in a cloud folder are encrypted with the folder key, not the local one.
+    const connection = sourceConnection?._id?.startsWith('cloud://')
+      ? { ...(await decryptCloudConnection(sourceConnection)) }
+      : { ...decryptConnection(sourceConnection) };
+    const driver = requireEngineDriver(connection);
+
+    if (!connection.port && driver.defaultPort) {
+      connection.port = driver.defaultPort.toString();
+    }
+
+    if (connection.useSshTunnel) {
+      const tunnel = await getSshTunnel(connection);
+      if (tunnel.state == 'error') {
+        throw new Error(tunnel.message);
+      }
+
+      connection.server = tunnel.localHost;
+      connection.port = tunnel.localPort;
+    }
+
+    connection.ssl = await extractConnectionSslParams(connection);
+    // Drivers that back up through an HTTP API (Cloudflare D1) need the same client as when connecting.
+    connection.axios = createConnectionHttpClient(connection);
+
+    const settingsValue = await config.getSettings();
+
+    const externalTools = {};
+    for (const pair of Object.entries(settingsValue || {})) {
+      const [name, value] = pair;
+      if (name.startsWith('externalTools.')) {
+        externalTools[name.substring('externalTools.'.length)] = value;
+      }
+    }
+
+    return { connection, driver, externalTools, settings: settingsValue || {} };
+  },
+
   commandArgsToCommandLine(commandArgs) {
     const { command, args, stdinFilePath } = commandArgs;
     let res = `${command} ${args.join(' ')}`;
@@ -995,16 +1248,71 @@ module.exports = {
     return res;
   },
 
+  nativeBackup_access: 'self',
+
   nativeBackup_meta: true,
-  async nativeBackup({ conid, database, outputFile, runid, options, selectedTables, skippedTables }) {
+  async nativeBackup({ conid, database, outputFile, runid, options, selectedTables, skippedTables }, req) {
+    const loadedPermissions = await loadPermissionsFromRequest(req);
+    await testConnectionPermission(conid, req, loadedPermissions);
+    await testStandardPermission('dbops/sql-dump/export', req, loadedPermissions);
+    await testDatabaseRolePermission(conid, database, 'read_content', req);
+    if (!isValidRunId(runid)) {
+      throw new Error('DBGM-00000 Invalid runid');
+    }
+    this.testNativeOpFilePath(outputFile, null);
+    const effectiveOptions = options || {};
+    if (process.env.STORAGE_DATABASE && effectiveOptions.allDatabases) {
+      if (!hasPermission('all-databases', loadedPermissions)) {
+        throw new Error('DBGM-00000 Permission all-databases not granted for backup of all databases');
+      }
+    }
+    socket.claimOwner(socket.runnerOwnerKey(runid), socket.getStrmidFromRequest(req));
+    const effectiveSelectedTables = selectedTables || [];
+    const effectiveSkippedTables = skippedTables || [];
+    const context = await this.getNativeOpContext(conid);
+
+    if (context.driver.supportsNodejsBackup && effectiveOptions.backupTool == context.driver.nodejsBackupTool) {
+      const { connection, driver } = context;
+      if (!driver.supportsNodejsBackup || !driver.backupDatabase) {
+        throw new Error(
+          'DBGM-00000 The selected database driver does not support the requested JavaScript backup tool'
+        );
+      }
+      return runners.promiseRunCore(
+        runid,
+        runner =>
+          driver.backupDatabase(
+            connection,
+            {
+              outputFile,
+              database,
+              options: {
+                ...effectiveOptions,
+                debug:
+                  driver.engine == 'mssql@dbgate-plugin-mssql' &&
+                  context.settings['behaviour.useDiagnosticTools'] === true,
+              },
+              selectedTables: effectiveSelectedTables,
+              skippedTables: effectiveSkippedTables,
+            },
+            runner
+          ),
+        () => {
+          socket.emitChanged(`files-changed`, { folder: 'sql' });
+          socket.emitChanged(`all-files-changed`);
+        },
+        'backup'
+      );
+    }
+
     const commandArgs = await this.getNativeOpCommandArgs('backup', {
       conid,
       database,
       inputFile: undefined,
       outputFile,
-      options,
-      selectedTables,
-      skippedTables,
+      options: effectiveOptions,
+      selectedTables: effectiveSelectedTables,
+      skippedTables: effectiveSkippedTables,
       argsFormat: 'spawn',
     });
 
@@ -1017,8 +1325,19 @@ module.exports = {
     });
   },
 
+  nativeBackupCommand_access: 'self',
+
   nativeBackupCommand_meta: true,
-  async nativeBackupCommand({ conid, database, outputFile, options, selectedTables, skippedTables }) {
+  async nativeBackupCommand({ conid, database, outputFile, options, selectedTables, skippedTables }, req) {
+    await this.testNativeOpPermission('backup', conid, database, req);
+    this.testNativeOpFilePath(outputFile, null);
+    const { driver, connection } = await this.getNativeOpContext(conid);
+    if (driver.supportsNodejsBackup && options?.backupTool == driver.nodejsBackupTool) {
+      throw new Error(
+        'DBGM-00000 The selected JavaScript backup tool runs inside DbGate and has no command line to copy'
+      );
+    }
+
     const commandArgs = await this.getNativeOpCommandArgs('backup', {
       conid,
       database,
@@ -1030,53 +1349,128 @@ module.exports = {
       argsFormat: 'shell',
     });
 
+    // only the command line is returned - commandArgs also hold the password (args, env)
     return {
-      ...commandArgs,
-      transformMessage: null,
-      commandLine: this.commandArgsToCommandLine(commandArgs),
+      commandLine: maskPasswordInCommandLine(this.commandArgsToCommandLine(commandArgs), connection.password),
     };
   },
 
-  nativeRestore_meta: true,
-  async nativeRestore({ conid, database, inputFile, runid }) {
-    const commandArgs = await this.getNativeOpCommandArgs('restore', {
-      conid,
-      database,
-      inputFile,
-      outputFile: undefined,
-      options: undefined,
-      argsFormat: 'spawn',
-    });
+  nativeRestore_access: 'self',
 
-    return runners.nativeRunCore(runid, {
-      ...commandArgs,
-      onFinished: () => {
-        this.syncModel({ conid, database, isFullRefresh: true });
-      },
-    });
+  nativeRestore_meta: true,
+  async nativeRestore({ conid, database, inputFile, inputUploadName, runid, options }, req) {
+    const loadedPermissions = await loadPermissionsFromRequest(req);
+    await testConnectionPermission(conid, req, loadedPermissions);
+    await testStandardPermission('dbops/sql-dump/import', req, loadedPermissions);
+    await testDatabaseRolePermission(conid, database, 'run_script', req);
+    const storedConnection = await connections.getCore({ conid });
+    if (storedConnection?.isReadOnly) {
+      throw new Error('DBGM-00000 Connection is read-only');
+    }
+    const effectiveOptions = options || {};
+    if (!isValidRunId(runid)) {
+      throw new Error('DBGM-00000 Invalid runid');
+    }
+    const restoreUploadPath = getRestoreUploadPath(inputFile, inputUploadName);
+    this.testNativeOpFilePath(inputFile, restoreUploadPath);
+    socket.claimOwner(socket.runnerOwnerKey(runid), socket.getStrmidFromRequest(req));
+    const onFinished = () => {
+      removeRestoreUpload(restoreUploadPath);
+      this.syncModel({ conid, database, isFullRefresh: true });
+    };
+
+    try {
+      const restrictToDatabase = process.env.STORAGE_DATABASE
+        ? !hasPermission('all-databases', loadedPermissions)
+        : false;
+      const context = await this.getNativeOpContext(conid);
+      if (context.driver.supportsNodejsRestore && effectiveOptions.restoreTool == context.driver.nodejsRestoreTool) {
+        const { connection, driver } = context;
+        if (!driver.supportsNodejsRestore || !driver.restoreDatabase) {
+          throw new Error(
+            'DBGM-00000 The selected database driver does not support the requested JavaScript restore tool'
+          );
+        }
+        return runners.promiseRunCore(
+          runid,
+          runner =>
+            driver.restoreDatabase(
+              connection,
+              {
+                inputFile,
+                database,
+                // Server-derived policy; uploaded files and request options cannot override it.
+                restrictToDatabase,
+                options: {
+                  ...effectiveOptions,
+                  debug:
+                    driver.engine == 'mssql@dbgate-plugin-mssql' &&
+                    context.settings['behaviour.useDiagnosticTools'] === true,
+                },
+              },
+              runner
+            ),
+          onFinished,
+          'restore'
+        );
+      }
+
+      const commandArgs = await this.getNativeOpCommandArgs('restore', {
+        conid,
+        database,
+        inputFile,
+        outputFile: undefined,
+        options: effectiveOptions,
+        argsFormat: 'spawn',
+      });
+
+      return runners.nativeRunCore(runid, {
+        ...commandArgs,
+        onFinished,
+      });
+    } catch (error) {
+      removeRestoreUpload(restoreUploadPath);
+      throw error;
+    }
   },
 
+  nativeRestoreCommand_access: 'self',
+
   nativeRestoreCommand_meta: true,
-  async nativeRestoreCommand({ conid, database, inputFile }) {
+  async nativeRestoreCommand({ conid, database, inputFile, options }, req) {
+    await this.testNativeOpPermission('restore', conid, database, req);
+    this.testNativeOpFilePath(inputFile, null);
+    const { driver, connection } = await this.getNativeOpContext(conid);
+    if (driver.supportsNodejsRestore && options?.restoreTool == driver.nodejsRestoreTool) {
+      throw new Error(
+        'DBGM-00000 The selected JavaScript restore tool runs inside DbGate and has no command line to copy'
+      );
+    }
+
     const commandArgs = await this.getNativeOpCommandArgs('restore', {
       conid,
       database,
       inputFile,
       outputFile: undefined,
-      options: undefined,
+      options,
       argsFormat: 'shell',
     });
 
+    // only the command line is returned - commandArgs also hold the password (args, env)
     return {
-      ...commandArgs,
-      transformMessage: null,
-      commandLine: this.commandArgsToCommandLine(commandArgs),
+      commandLine: maskPasswordInCommandLine(this.commandArgsToCommandLine(commandArgs), connection.password),
     };
   },
+
+  executeSessionQuery_access: 'self',
 
   executeSessionQuery_meta: true,
   async executeSessionQuery({ sesid, conid, database, sql }, req) {
     await testConnectionPermission(conid, req);
+    // the query tab of single-connection drivers (DuckDB) - same checks as sessions.executeQuery
+    await testStandardPermission('dbops/query', req);
+    await testDatabaseRolePermission(conid, database, 'run_script', req);
+    socket.claimOwner(socket.sessionOwnerKey(sesid), socket.getStrmidFromRequest(req));
     logger.info({ sesid, sql }, 'DBGM-00010 Processing query');
     sessions.dispatchMessage(sesid, {
       message: 'Query execution started',
@@ -1089,9 +1483,21 @@ module.exports = {
     return { state: 'ok' };
   },
 
+  evalJsonScript_access: 'self',
+
   evalJsonScript_meta: true,
   async evalJsonScript({ conid, database, script, runid }, req) {
     await testConnectionPermission(conid, req);
+    // import/export through a single-connection driver (DuckDB); runners.start applies the same
+    // directory check to the scripts it runs
+    await testDatabaseRolePermission(conid, database, 'read_content', req);
+    if (!isValidRunId(runid)) {
+      throw new Error('DBGM-00000 Invalid runid');
+    }
+    if (!platformInfo.isElectron) {
+      await checkJsonScriptAccess(script, req, { hostConnection: { conid, database } });
+    }
+    socket.claimOwner(socket.runnerOwnerKey(runid), socket.getStrmidFromRequest(req));
     const opened = await this.ensureOpened(conid, database);
 
     opened.subprocess.send({ msgtype: 'evalJsonScript', script, runid });

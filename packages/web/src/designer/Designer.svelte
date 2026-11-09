@@ -2,10 +2,23 @@
   import { getActiveComponent } from '../utility/createActivator';
   import registerCommand from '../commands/registerCommand';
   import { __t } from '../translations';
+  import { getCommandSource } from '../commands/commandSource';
+  import { getUsageTab } from '../utility/usageAnalytics';
+
+  /** The designer canvas is shared, the event belongs to the tab which hosts it. */
+  function getDesignerUsageFeature(): string {
+    const tab = getUsageTab();
+    if (tab == 'diagram') return 'diagram';
+    if (tab == 'perspective') return 'perspective_designer';
+    return 'query_designer';
+  }
   const getCurrentEditor = () => getActiveComponent('Designer');
 
   registerCommand({
     id: 'designer.arrange',
+    // Auto arrange runs the same command programmatically; only explicit invocations are tracked.
+    usageAnalytics: () =>
+      getCommandSource() == 'command' ? undefined : { feature: getDesignerUsageFeature(), action: 'arrange' },
     category: __t('command.designer', { defaultMessage: 'Designer' }),
     icon: 'icon arrange',
     name: __t('command.designer.arrange', { defaultMessage: 'Arrange' }),
@@ -55,7 +68,7 @@
 <script lang="ts">
   import DesignerTable from './DesignerTable.svelte';
   import { isConnectedByReference } from './designerTools';
-  import uuidv1 from 'uuid/v1';
+  import { v1 as uuidv1 } from 'uuid';
   import { getTableInfo, useAllApps, useDatabaseInfo } from '../utility/metadataLoaders';
   import cleanupDesignColumns from './cleanupDesignColumns';
   import _ from 'lodash';
@@ -226,7 +239,7 @@
 
   async function detectSize(tables, domTables) {
     await tick();
-    const rects = _.values(domTables).map(x => x.getRect());
+    const rects = _.compact(_.values(domTables).map(x => x.getRect()));
     const maxX = rects.length > 0 ? _.max(rects.map(x => x.right)) : 0;
     const maxY = rects.length > 0 ? _.max(rects.map(x => x.bottom)) : 0;
 
@@ -683,6 +696,7 @@
             const domTable = domTables[x.designerId] as any;
             if (domTable) {
               const rect = domTable.getRect();
+              if (!rect) return x;
               const rectZoomed = {
                 left: rect.left / zoomKoef,
                 right: rect.right / zoomKoef,
@@ -735,6 +749,7 @@
       const domTable = domTables[table.designerId] as any;
       if (!domTable) continue;
       const rect = domTable.getRect();
+      if (!rect) continue;
       graph.addNode(
         table.designerId,
         (rect.right - rect.left) / zoomKoef,
@@ -831,7 +846,7 @@
     }
     css += ' body { overflow: scroll; }';
     saveFileToDisk(async filePath => {
-      await apiCall('files/export-diagram', {
+      return await apiCall('files/export-diagram', {
         filePath,
         html: domCanvas.outerHTML,
         css,
@@ -843,7 +858,7 @@
   }
 
   export async function exportDiagramPng() {
-    const rects = _.values(domTables).map((x: any) => x.getRect());
+    const rects = _.compact(_.values(domTables).map((x: any) => x.getRect()));
     const contentWidth = rects.length > 0 ? _.max(rects.map((x: any) => x.right)) + 50 : canvasWidth;
     const contentHeight = rects.length > 0 ? _.max(rects.map((x: any) => x.bottom)) + 50 : canvasHeight;
     const scale = 2;
@@ -861,7 +876,7 @@
     });
     saveFileToDisk(
       async filePath => {
-        await apiCall('files/export-diagram-png', {
+        return await apiCall('files/export-diagram-png', {
           filePath,
           pngBase64,
         });

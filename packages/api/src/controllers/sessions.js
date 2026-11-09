@@ -12,15 +12,71 @@ const { getLogger, extractErrorLogData, removeSqlFrontMatter } = require('dbgate
 const pipeForkLogs = require('../utility/pipeForkLogs');
 const config = require('./config');
 const { sendToAuditLog } = require('../utility/auditlog');
-const { testStandardPermission, testDatabaseRolePermission } = require('../utility/hasPermission');
-const { getStaticTokenSecret } = require('../auth/authCommon');
-const jwt = require('jsonwebtoken');
+const {
+  testStandardPermission,
+  testDatabaseRolePermission,
+  testConnectionPermission,
+} = require('../utility/hasPermission');
+const { verifyTeamFileExecToken } = require('../utility/teamFileExecToken');
+const requireEngineDriver = require('../utility/requireEngineDriver');
 
 const logger = getLogger('sessions');
 
+// A team-file grant is checked against the statement with its front matter removed (see
+// hashTeamFileContent), but the front matter block is not required to hold only comments - so
+// the text that runs under a grant is the one that was checked. The block is blanked out rather
+// than cut, so that line numbers in messages still match the editor.
+function blankOutSqlFrontMatter(sql) {
+  if (typeof sql != 'string') return sql;
+  const body = removeSqlFrontMatter(sql) ?? '';
+  const frontMatterBlock = sql.substring(0, sql.length - body.length);
+  return frontMatterBlock.replace(/[^\n]/g, '') + body;
+}
+
+// events of a session go to the browser tab that opened it (socket.emitOwned)
+const sessionOwnerKey = sesid => socket.sessionOwnerKey(sesid);
+
+// a name of an app folder or of a query in it, which becomes part of a path under appdir();
+// "." is refused too, so an app query always lives in a real app folder, not in the appdir() root
+function isSafeAppFileName(name) {
+  return typeof name == 'string' && name.length > 0 && name != '.' && !/[\\/\0]|\.\./.test(name);
+}
+
+// Identifies the logged-in user of a request, to tie a session to the user who created it.
+// licenseUid names the login (ad:<login>, local:<login>, ...), while userId can be shared - AD
+// logins without a storage row all get -1. A database login is a login to one connection.
+// Basic auth sets req.auth, not req.user.
+function getRequestUserKey(req) {
+  if (!req?.user) {
+    return req?.auth?.user != null ? JSON.stringify(['basic-auth', req.auth.user]) : null;
+  }
+  return JSON.stringify([
+    req.user.amoid ?? null,
+    req.user.licenseUid ?? req.user.login ?? req.user.userId ?? null,
+    req.user.conid ?? null,
+  ]);
+}
+
 module.exports = {
+  // A session id is only a handle: the caller must still be allowed to use the session's connection,
+  // and a session created by a logged-in user is not usable by another user
+  async getSessionForRequest(sesid, req) {
+    const session = this.opened.find(x => x.sesid == sesid);
+    if (!session) {
+      throw new Error('Invalid session');
+    }
+    if (req) {
+      if (session.ownerKey && session.ownerKey != getRequestUserKey(req)) {
+        throw new Error('DBGM-00000 Session belongs to another user');
+      }
+      await testConnectionPermission(session.conid, req);
+    }
+    return session;
+  },
+
   /** @type {import('dbgate-types').OpenedSession[]} */
   opened: [],
+  requests: {},
 
   // handle_error(sesid, props) {
   //   const { error } = props;
@@ -37,14 +93,14 @@ module.exports = {
   // },
   dispatchMessage(sesid, message) {
     if (_.isString(message)) {
-      socket.emit(`session-info-${sesid}`, {
+      socket.emitOwned(sessionOwnerKey(sesid), `session-info-${sesid}`, {
         message,
         time: new Date(),
         severity: 'info',
       });
     }
     if (_.isPlainObject(message)) {
-      socket.emit(`session-info-${sesid}`, {
+      socket.emitOwned(sessionOwnerKey(sesid), `session-info-${sesid}`, {
         time: new Date(),
         severity: 'info',
         ...message,
@@ -58,7 +114,7 @@ module.exports = {
   },
 
   handle_done(sesid, props) {
-    socket.emit(`session-done-${sesid}`);
+    socket.emitOwned(sessionOwnerKey(sesid), `session-done-${sesid}`);
     if (!props.skipFinishedMessage) {
       if (props.controlCommand) {
         this.dispatchMessage(sesid, `${_.startCase(props.controlCommand)} finished`);
@@ -68,7 +124,7 @@ module.exports = {
     }
     const session = this.opened.find(x => x.sesid == sesid);
     if (session.loadingReader_jslid) {
-      socket.emit(`session-jslid-done-${session.loadingReader_jslid}`);
+      socket.emitOwned(sessionOwnerKey(sesid), `session-jslid-done-${session.loadingReader_jslid}`);
     }
     if (props.autoCommit) {
       this.executeControlCommand({ sesid, command: 'commitTransaction' });
@@ -80,7 +136,7 @@ module.exports = {
 
   handle_recordset(sesid, props) {
     const { jslid, resultIndex } = props;
-    socket.emit(`session-recordset-${sesid}`, { jslid, resultIndex });
+    socket.emitOwned(sessionOwnerKey(sesid), `session-recordset-${sesid}`, { jslid, resultIndex });
   },
 
   handle_endrecordset(sesid, props) {
@@ -99,26 +155,70 @@ module.exports = {
 
   handle_charts(sesid, props) {
     const { jslid, charts, resultIndex } = props;
-    socket.emit(`session-charts-${sesid}`, { jslid, resultIndex, charts });
+    socket.emitOwned(sessionOwnerKey(sesid), `session-charts-${sesid}`, { jslid, resultIndex, charts });
   },
 
   handle_initializeFile(sesid, props) {
     const { jslid } = props;
-    socket.emit(`session-initialize-file-${jslid}`);
+    socket.emitOwned(sessionOwnerKey(sesid), `session-initialize-file-${jslid}`);
   },
 
   handle_changedCurrentDatabase(sesid, props) {
     const { database } = props;
     this.dispatchMessage(sesid, `Current database changed to ${database}`);
-    socket.emit(`session-changedb-${sesid}`, { database });
+    socket.emitOwned(sessionOwnerKey(sesid), `session-changedb-${sesid}`, { database });
   },
 
   handle_ping() {},
 
+  handle_response(sesid, props) {
+    const { msgid } = props;
+    const request = this.requests[msgid];
+    if (!request) return;
+    delete this.requests[msgid];
+    request.resolve(_.omit(props, ['msgtype', 'msgid', 'sesid']));
+  },
+
+  sendRequest(session, message) {
+    const msgid = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        session.subprocess.off('exit', handleExit);
+        delete this.requests[msgid];
+      };
+      const handleExit = () => {
+        cleanup();
+        reject(new Error('DBGM-00341 Session process exited before response was received'));
+      };
+      this.requests[msgid] = {
+        resolve: value => {
+          cleanup();
+          resolve(value);
+        },
+        reject: error => {
+          cleanup();
+          reject(error);
+        },
+      };
+      session.subprocess.once('exit', handleExit);
+      session.subprocess.send({ ...message, msgid }, err => {
+        if (err && this.requests[msgid]) {
+          this.requests[msgid].reject(err);
+        }
+      });
+    });
+  },
+
+  create_access: 'self',
+
   create_meta: true,
-  async create({ conid, database }) {
+  async create({ conid, database }, req) {
+    // connections.getCore performs no authorization of its own, and the session subprocess it
+    // feeds is opened with the connection's full credentials, so the check has to happen here.
+    await testConnectionPermission(conid, req);
     const sesid = crypto.randomUUID();
     const connection = await connections.getCore({ conid });
+    const globalSettings = await config.getSettings();
     const subprocess = fork(
       global['API_PACKAGE'] || process.argv[1],
       [
@@ -129,6 +229,10 @@ module.exports = {
         // ...process.argv.slice(3),
       ],
       {
+        env: {
+          ...process.env,
+          NODE_NO_WARNINGS: globalSettings?.['behaviour.useDiagnosticTools'] === true ? '0' : '1',
+        },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       }
     );
@@ -139,8 +243,10 @@ module.exports = {
       subprocess,
       connection,
       sesid,
+      ownerKey: getRequestUserKey(req),
     };
     this.opened.push(newOpened);
+    socket.setOwner(sessionOwnerKey(sesid), socket.getStrmidFromRequest(req));
     subprocess.on('message', message => {
       // @ts-ignore
       const { msgtype } = message;
@@ -150,7 +256,8 @@ module.exports = {
     subprocess.on('exit', () => {
       this.opened = this.opened.filter(x => x.sesid != sesid);
       this.dispatchMessage(sesid, 'Query session closed');
-      socket.emit(`session-closed-${sesid}`);
+      socket.emitOwned(sessionOwnerKey(sesid), `session-closed-${sesid}`);
+      socket.removeOwner(sessionOwnerKey(sesid));
     });
     subprocess.on('error', () => {
       this.opened = this.opened.filter(x => x.sesid != sesid);
@@ -160,28 +267,40 @@ module.exports = {
       msgtype: 'connect',
       ...connection,
       database,
-      globalSettings: await config.getSettings(),
+      globalSettings,
     });
     return _.pick(newOpened, ['conid', 'database', 'sesid']);
   },
 
+  executeQuery_access: 'self',
+
   executeQuery_meta: true,
   async executeQuery({ sesid, sql, autoCommit, autoDetectCharts, limitRows, frontMatter }, req) {
-    let useTokenIsOk = false;
-    if (frontMatter?.useToken) {
-      const decoded = jwt.verify(frontMatter.useToken, getStaticTokenSecret());
-      if (decoded?.['contentHash'] == crypto.createHash('md5').update(removeSqlFrontMatter(sql)).digest('hex')) {
-        useTokenIsOk = true;
-      }
-    }
-    if (!useTokenIsOk) {
+    // The session is resolved first because a team-file execution grant is only good for the
+    // connection and database the file pins, so it cannot be checked without knowing which
+    // session the statement would run in.
+    const session = await this.getSessionForRequest(sesid, req);
+
+    // A valid grant means this exact statement was handed to this exact caller by
+    // teamFiles.getContent, which already checked their "use" access to the file - that is what
+    // lets an autoExecute team file run for a user who may not read it. The grant carries the
+    // team file it came from as a claim, so execGrantStillStands reloads that file and derives
+    // the access again rather than trusting it.
+    const grant = verifyTeamFileExecToken(frontMatter?.useToken, sql, req, session);
+    const standing = grant && (await require('./teamFiles').execGrantStillStands(grant.teamFileId, sql, session, req));
+
+    if (!standing) {
       await testStandardPermission('dbops/query', req);
     }
-    const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
-    }
-    if (!useTokenIsOk) {
+
+    // Only a file pinned to this connection and database stands in for the database role. A file
+    // that pins none says nothing about where it may run, so the role is still required and the
+    // caller cannot spend the grant on a database they do not already hold it for.
+    //
+    // The answer comes from execGrantStillStands, which reads the file as it stands now, and not
+    // from the token: a grant minted while the file was pinned carries that claim for its whole
+    // lifetime, and unpinning the file has to take the bypass away immediately.
+    if (!standing || !standing.isTargetBound) {
       await testDatabaseRolePermission(session.conid, session.database, 'run_script', req);
     }
 
@@ -202,24 +321,30 @@ module.exports = {
       message: 'Query execution started',
       sql,
     });
+    let dbinfo = null;
+    try {
+      dbinfo = (await require('./databaseConnections').ensureOpened(session.conid, session.database))?.structure;
+    } catch (err) {
+      logger.warn(extractErrorLogData(err), 'DBGM-00342 Error loading structure for query result metadata');
+    }
     session.subprocess.send({
       msgtype: 'executeQuery',
-      sql,
+      sql: standing ? blankOutSqlFrontMatter(sql) : sql,
       autoCommit,
       autoDetectCharts: autoDetectCharts || !!frontMatter?.['selected-chart'],
       limitRows,
       frontMatter,
+      dbinfo,
     });
 
     return { state: 'ok' };
   },
 
+  executeControlCommand_access: 'self',
+
   executeControlCommand_meta: true,
-  async executeControlCommand({ sesid, command }) {
-    const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
-    }
+  async executeControlCommand({ sesid, command }, req) {
+    const session = await this.getSessionForRequest(sesid, req);
 
     logger.info({ sesid, command }, 'DBGM-00020 Processing control command');
     this.dispatchMessage(sesid, `${_.startCase(command)} started`);
@@ -228,12 +353,28 @@ module.exports = {
     return { state: 'ok' };
   },
 
-  setIsolationLevel_meta: true,
-  async setIsolationLevel({ sesid, level }) {
-    const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
+  saveQueryResultData_access: 'self',
+
+  saveQueryResultData_meta: true,
+  async saveQueryResultData({ sesid, changeSet, sql, autoCommit }, req) {
+    await testStandardPermission('dbops/query', req);
+    const session = await this.getSessionForRequest(sesid, req);
+    await testDatabaseRolePermission(session.conid, session.database, 'run_script', req);
+
+    const res = await this.sendRequest(session, { msgtype: 'saveQueryResultData', changeSet, sql, autoCommit });
+    if (res.errorMessage) {
+      return {
+        errorMessage: res.errorMessage,
+      };
     }
+    return res.result || { state: 'ok' };
+  },
+
+  setIsolationLevel_access: 'self',
+
+  setIsolationLevel_meta: true,
+  async setIsolationLevel({ sesid, level }, req) {
+    const session = await this.getSessionForRequest(sesid, req);
 
     logger.info({ sesid, level }, 'DBGM-00315 Setting transaction isolation level');
     session.subprocess.send({ msgtype: 'setIsolationLevel', level });
@@ -241,9 +382,31 @@ module.exports = {
     return { state: 'ok' };
   },
 
+  executeReader_access: 'self',
+
   executeReader_meta: true,
-  async executeReader({ conid, database, sql, queryName, appFolder }) {
-    const { sesid } = await this.create({ conid, database });
+  async executeReader({ conid, database, sql, queryName, appFolder }, req) {
+    await testConnectionPermission(conid, req);
+    // The query is read from the app folder only when both are given (see fileName below). App
+    // queries from the object list send just queryName (the label) together with their sql.
+    const isAppQuery = !!(queryName && appFolder);
+    if (isAppQuery && (!isSafeAppFileName(queryName) || !isSafeAppFileName(appFolder))) {
+      throw new Error('DBGM-00000 Invalid query name');
+    }
+    // The data grid uses this to fetch all rows of what it shows, so reading the data is enough for
+    // SQL. Drivers of document databases (MongoDB, ...) evaluate the query text as JavaScript in
+    // DbGate itself, which is running a script, so they need what sessions.executeQuery needs.
+    // That holds for app queries as well - the app file is not trusted code (its text is
+    // evaluated the same way).
+    const driver = requireEngineDriver(await connections.getCore({ conid }));
+    if (driver?.databaseEngineTypes?.includes('document')) {
+      await testStandardPermission('dbops/query', req);
+      await testDatabaseRolePermission(conid, database, 'run_script', req);
+    } else {
+      await testDatabaseRolePermission(conid, database, 'read_content', req);
+    }
+
+    const { sesid } = await this.create({ conid, database }, req);
     const session = this.opened.find(x => x.sesid == sesid);
     session.killOnDone = true;
     const jslid = crypto.randomUUID();
@@ -255,22 +418,25 @@ module.exports = {
     return { jslid };
   },
 
+  stopLoadingReader_access: 'self',
+
   stopLoadingReader_meta: true,
-  async stopLoadingReader({ jslid }) {
+  async stopLoadingReader({ jslid }, req) {
     const session = this.opened.find(x => x.loadingReader_jslid == jslid);
-    if (session) {
+    if (session && (!req || !session.ownerKey || session.ownerKey == getRequestUserKey(req))) {
       this.kill({ sesid: session.sesid });
     }
     return true;
   },
 
+  startProfiler_access: 'self',
+
   startProfiler_meta: true,
-  async startProfiler({ sesid }) {
+  async startProfiler({ sesid }, req) {
+    // the profiler shows every statement the database server runs
+    await testStandardPermission('dbops/profiler', req);
     const jslid = crypto.randomUUID();
-    const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
-    }
+    const session = await this.getSessionForRequest(sesid, req);
 
     logger.info({ sesid }, 'DBGM-00021 Starting profiler');
     session.loadingReader_jslid = jslid;
@@ -279,12 +445,11 @@ module.exports = {
     return { state: 'ok', jslid };
   },
 
+  stopProfiler_access: 'self',
+
   stopProfiler_meta: true,
-  async stopProfiler({ sesid }) {
-    const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
-    }
+  async stopProfiler({ sesid }, req) {
+    const session = await this.getSessionForRequest(sesid, req);
     session.subprocess.send({ msgtype: 'stopProfiler' });
     return { state: 'ok' };
   },
@@ -299,22 +464,23 @@ module.exports = {
   //   return { state: 'ok' };
   // },
 
+  kill_access: 'self',
+
   kill_meta: true,
-  async kill({ sesid }) {
-    const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
-    }
+  async kill({ sesid }, req) {
+    const session = await this.getSessionForRequest(sesid, req);
     session.subprocess.kill();
     this.dispatchMessage(sesid, 'Connection closed');
     return { state: 'ok' };
   },
 
+  ping_access: 'self',
+
   ping_meta: true,
-  async ping({ sesid }) {
+  async ping({ sesid }, req) {
     const session = this.opened.find(x => x.sesid == sesid);
-    if (!session) {
-      throw new Error('Invalid session');
+    if (!session || (req && session.ownerKey && session.ownerKey != getRequestUserKey(req))) {
+      return { state: 'missing' };
     }
     try {
       session.subprocess.send({ msgtype: 'ping' });
@@ -322,7 +488,7 @@ module.exports = {
       logger.error(extractErrorLogData(err), 'DBGM-00145 Error pinging session');
 
       return {
-        status: 'error',
+        state: 'missing',
         message: 'Ping failed',
       };
     }

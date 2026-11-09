@@ -1,6 +1,21 @@
 import _uniq from 'lodash/uniq';
 import _cloneDeepWith from 'lodash/cloneDeepWith';
-import { evalShellApiFunctionName, compileShellApiFunctionName, extractShellApiPlugins } from './packageTools';
+import { evalShellApiFunctionName, compileShellApiFunctionName, extractShellApiPlugins, assertValidJsIdentifier, assertValidShellApiFunctionName } from './packageTools';
+
+// Line terminators (LF, CR, U+2028, U+2029) end a `//` comment; keep every line commented so
+// comment/schedule text from a JSON script cannot break out and run as code. GHSA-rfx7-cmmf-7ff7
+const JS_LINE_TERMINATORS_RE = /\r\n|[\r\n\u2028\u2029]/g;
+// runners.js/scheduler.js scan the whole generated script text for `// @require ...` /
+// `// @schedule ...` with unanchored regexes, so a directive can be formed by an '@' appearing
+// *anywhere* in user-controlled text next to a '//' - not just one re-commented at a line start
+// (e.g. "sometext // @require dbgate-plugin-evil" on a single line). Escape every '@' so
+// user-controlled comment/schedule text can never reconstruct a directive, regardless of position.
+const AT_RE = /@/g;
+function sanitizeCommentText(text): string {
+  return String(text)
+    .replace(AT_RE, '\\@')
+    .replace(JS_LINE_TERMINATORS_RE, '\n// ');
+}
 
 export interface ScriptWriterGeneric {
   allocVariable(prefix?: string);
@@ -40,6 +55,7 @@ export class ScriptWriterJavaScript implements ScriptWriterGeneric {
   }
 
   assignCore(variableName, functionName, props) {
+    assertValidJsIdentifier(variableName, 'variableName');
     this._put(`const ${variableName} = await ${functionName}(${JSON.stringify(props)});`);
   }
 
@@ -49,6 +65,7 @@ export class ScriptWriterJavaScript implements ScriptWriterGeneric {
   }
 
   assignValue(variableName, jsonValue) {
+    assertValidJsIdentifier(variableName, 'variableName');
     this._put(`const ${variableName} = ${JSON.stringify(jsonValue)};`);
   }
 
@@ -57,8 +74,13 @@ export class ScriptWriterJavaScript implements ScriptWriterGeneric {
   }
 
   copyStream(sourceVar, targetVar, colmapVar = null, progressName?: string | { name: string; runid: string }) {
+    assertValidJsIdentifier(sourceVar, 'sourceVar');
+    assertValidJsIdentifier(targetVar, 'targetVar');
     let opts = '{';
-    if (colmapVar) opts += `columns: ${colmapVar}, `;
+    if (colmapVar) {
+      assertValidJsIdentifier(colmapVar, 'colmapVar');
+      opts += `columns: ${colmapVar}, `;
+    }
     if (progressName) opts += `progressName: ${JSON.stringify(progressName)}, `;
     opts += '}';
 
@@ -74,7 +96,7 @@ export class ScriptWriterJavaScript implements ScriptWriterGeneric {
   }
 
   comment(s) {
-    this._put(`// ${s}`);
+    this._put(`// ${sanitizeCommentText(s)}`);
   }
 
   getScript(schedule = null) {
@@ -82,14 +104,14 @@ export class ScriptWriterJavaScript implements ScriptWriterGeneric {
     let prefix = _uniq(packageNames)
       .map(packageName => `// @require ${packageName}\n`)
       .join('');
-    if (schedule) prefix += `// @schedule ${schedule}`;
+    if (schedule) prefix += `// @schedule ${sanitizeCommentText(schedule)}`;
     if (prefix) prefix += '\n';
 
     return prefix + this.s;
   }
 
   zipDirectory(inputDirectory, outputFile) {
-    this._put(`await dbgateApi.zipDirectory('${inputDirectory}', '${outputFile}');`);
+    this._put(`await dbgateApi.zipDirectory(${JSON.stringify(inputDirectory)}, ${JSON.stringify(outputFile)});`);
   }
 }
 
@@ -214,6 +236,8 @@ export class ScriptWriterEval implements ScriptWriterGeneric {
   requirePackage(packageName) {}
 
   async assign(variableName, functionName, props) {
+    assertValidJsIdentifier(variableName, 'variableName');
+    assertValidShellApiFunctionName(functionName);
     const func = evalShellApiFunctionName(functionName, this.dbgateApi, this.requirePlugin);
 
     this.variables[variableName] = await func(
@@ -226,10 +250,14 @@ export class ScriptWriterEval implements ScriptWriterGeneric {
   }
 
   assignValue(variableName, jsonValue) {
+    assertValidJsIdentifier(variableName, 'variableName');
     this.variables[variableName] = jsonValue;
   }
 
   async copyStream(sourceVar, targetVar, colmapVar = null, progressName?: string | { name: string; runid: string }) {
+    assertValidJsIdentifier(sourceVar, 'sourceVar');
+    assertValidJsIdentifier(targetVar, 'targetVar');
+    if (colmapVar != null) assertValidJsIdentifier(colmapVar, 'colmapVar');
     await this.dbgateApi.copyStream(this.variables[sourceVar], this.variables[targetVar], {
       progressName: _cloneDeepWith(progressName, node => {
         if (node?.$runid) {

@@ -6,6 +6,8 @@ const driverBases = require('../frontend/drivers');
 const { splitQuery, sqliteSplitterOptions } = require('dbgate-query-splitter');
 const { getLogger, createBulkInsertStreamBase, extractErrorLogData } = global.DBGATE_PACKAGES['dbgate-tools'];
 const { runStreamItem, waitForDrain, modifyRow } = require('./helpers');
+const { fromBetterSqlite3 } = require('dbgate-sqlite-dumper/better-sqlite3');
+const { backupWithSqliteDumper, restoreWithSqliteDumper } = require('./sqliteDumperOperations');
 
 const logger = getLogger('sqliteDriver');
 
@@ -24,6 +26,7 @@ const driver = {
   async connect({ databaseFile, isReadOnly }) {
     const Database = getBetterSqlite();
     const client = new Database(databaseFile, { readonly: !!isReadOnly });
+    client.defaultSafeIntegers(true);
     return {
       client,
     };
@@ -44,6 +47,9 @@ const driver = {
         columns: columns.map((col) => ({
           columnName: col.name,
           dataType: col.type,
+          tableName: col.table || undefined,
+          tableSchema: col.database || undefined,
+          sourceColumnName: col.column || undefined,
         })),
       };
     } else {
@@ -129,6 +135,9 @@ const driver = {
         columns: columns.map((col) => ({
           columnName: col.name,
           dataType: col.type,
+          tableName: col.table || undefined,
+          tableSchema: col.database || undefined,
+          sourceColumnName: col.column || undefined,
         })),
       }),
     });
@@ -139,6 +148,20 @@ const driver = {
   async writeTable(dbhan, name, options) {
     return createBulkInsertStreamBase(this, stream, dbhan, name, options);
   },
+  async backupDatabase(connection, settings, runner) {
+    return backupWithSqliteDumper(this, connection, settings, runner, {
+      product: 'SQLite',
+      createDumperConnection: fromBetterSqlite3,
+    });
+  },
+
+  async restoreDatabase(connection, settings, runner) {
+    return restoreWithSqliteDumper(this, connection, settings, runner, {
+      product: 'SQLite',
+      createDumperConnection: fromBetterSqlite3,
+    });
+  },
+
   async getVersion(dbhan) {
     const { rows } = await this.query(dbhan, 'select sqlite_version() as version');
     const { version } = rows[0];

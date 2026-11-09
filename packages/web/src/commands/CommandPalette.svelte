@@ -25,11 +25,17 @@
   });
 
   function extractDbItems(db, dbConnectionInfo, connectionList, $extensions, currentThemeType) {
+    const allObjects = _.flatten(
+      ['tables', 'collections', 'views', 'matviews', 'procedures', 'functions'].map(objectTypeField =>
+        ((db || {})[objectTypeField] || []).map(obj => ({ objectTypeField, obj }))
+      )
+    );
+    const pureNameCounts = _.countBy(allObjects, ({ obj }) => obj.pureName);
     const objectList = _.flatten(
       ['tables', 'collections', 'views', 'matviews', 'procedures', 'functions'].map(objectTypeField =>
         _.sortBy(
           ((db || {})[objectTypeField] || []).map(obj => ({
-            text: obj.pureName,
+            text: pureNameCounts[obj.pureName] > 1 ? fullNameToLabel(obj) : obj.pureName,
             onClick: () => handleDatabaseObjectClick({ objectTypeField, ...dbConnectionInfo, ...obj }),
             icon: databaseObjectIcons[objectTypeField],
           })),
@@ -43,11 +49,11 @@
       if (connection.singleDatabase) continue;
       if (getCurrentConfig()?.singleDbConnection) continue;
       const databases = getLocalStorage(`database_list_${conid}`) || [];
-      
+
       const driver = findEngineDriver(connection, $extensions);
       const driverIcon = getDriverIcon(driver, currentThemeType);
       const connectionIcon = driverIcon || 'img database';
-      
+
       for (const db of databases) {
         databaseList.push({
           text: `${db.name} on ${getConnectionLabel(connection)}`,
@@ -66,13 +72,14 @@
 </script>
 
 <script>
-  import { filterName, getConnectionLabel, findEngineDriver } from 'dbgate-tools';
+  import { filterName, getConnectionLabel, findEngineDriver, fullNameToLabel } from 'dbgate-tools';
 
   import _ from 'lodash';
   import { onMount } from 'svelte';
   import fuzzy from 'fuzzy';
   import { databaseObjectIcons, handleDatabaseObjectClick } from '../appobj/DatabaseObjectAppObject.svelte';
   import FontIcon from '../icons/FontIcon.svelte';
+  import { runWithCommandSource } from './commandSource';
   import {
     commandsCustomized,
     currentDatabase,
@@ -91,6 +98,7 @@
   import { _tval, _t } from '../translations';
   import { getDriverIcon } from '../utility/driverIcons';
   import { currentThemeType } from '../plugins/themes';
+  import { HIGHLIGHT_END, HIGHLIGHT_START, splitHighlightedText } from '../utility/highlightSegments';
 
   let domInput;
   let filter = '';
@@ -128,13 +136,13 @@
       ).filter(x => !x.isGroupCommand),
       {
         extract: x => _tval(x.text),
-        pre: '<b>',
-        post: '</b>',
+        pre: HIGHLIGHT_START,
+        post: HIGHLIGHT_END,
       }
     )
     .map(x => ({
       ...x.original,
-      text: x.string,
+      textSegments: splitHighlightedText(x.string),
     }));
 
   function handleCommand(command) {
@@ -145,7 +153,7 @@
       selectedIndex = 0;
     } else {
       $visibleCommandPalette = null;
-      command.onClick();
+      runWithCommandSource('palette', () => command.onClick());
     }
   }
 
@@ -190,7 +198,8 @@
           domInput.focus();
         }}
       >
-        <FontIcon icon="icon menu" /> {_t('commandPalette.commands', { defaultMessage: 'Commands' })}
+        <FontIcon icon="icon menu" />
+        {_t('commandPalette.commands', { defaultMessage: 'Commands' })}
       </div>
       <div
         class="page"
@@ -200,7 +209,8 @@
           domInput.focus();
         }}
       >
-        <FontIcon icon="icon database" /> {_t('common.database', { defaultMessage: 'Database' })}
+        <FontIcon icon="icon database" />
+        {_t('common.database', { defaultMessage: 'Database' })}
       </div>
     </div>
     <div class="mainInner">
@@ -211,7 +221,9 @@
           bind:value={filter}
           on:keydown={handleKeyDown}
           placeholder={_tval(parentCommand?.text) ||
-            ($visibleCommandPalette == 'database' ? _t('commandPalette.searchInDatabase', { defaultMessage: 'Search in database' }) : _t('commandPalette.searchInCommands', { defaultMessage: 'Search in commands' }))}
+            ($visibleCommandPalette == 'database'
+              ? _t('commandPalette.searchInDatabase', { defaultMessage: 'Search in database' })
+              : _t('commandPalette.searchInCommands', { defaultMessage: 'Search in commands' }))}
         />
       </div>
       <div class="content">
@@ -226,7 +238,8 @@
               {#if command.icon}
                 <span class="mr-1"><FontIcon icon={command.icon} /></span>
               {/if}
-              {@html command.text}
+              <!-- one line on purpose: whitespace between the segments would show up between the characters -->
+              {#each command.textSegments as seg}{#if seg.highlighted}<b>{seg.text}</b>{:else}{seg.text}{/if}{/each}
             </div>
             {#if command.keyText}
               <div class="shortcut">{formatKeyText(command.keyText)}</div>
@@ -266,9 +279,10 @@
     position: relative;
     z-index: 2;
     width: 600px;
+    max-width: calc(100vw - 24px);
     background: var(--theme-modal-background);
     border: var(--theme-modal-border);
-    border-radius: 6px;
+    border-radius: var(--dim-radius-lg);
     box-shadow: var(--theme-modal-shadow);
     overflow: hidden;
   }
@@ -360,7 +374,9 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    transition: color 150ms ease-in-out, border-color 150ms ease-in-out;
+    transition:
+      color 150ms ease-in-out,
+      border-color 150ms ease-in-out;
   }
 
   .page:hover {

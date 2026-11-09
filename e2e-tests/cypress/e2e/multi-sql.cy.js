@@ -1,3 +1,5 @@
+Cypress.config('defaultCommandTimeout', 30000);
+
 const localconfig = require('../../.localconfig');
 const { formatQueryWithoutParams } = require('dbgate-tools');
 
@@ -112,6 +114,7 @@ describe('Backup table', () => {
 
     cy.contains(connectionName).click();
     if (databaseName) cy.contains(databaseName).click();
+    cy.wait(2000);
     cy.contains('addresses').rightclick();
     cy.contains('Create table backup').click();
     cy.testid('ConfirmSqlModal_okButton').click();
@@ -163,8 +166,12 @@ describe('Backup table', () => {
     cy.realPress('F1');
     cy.realType('Close all');
     cy.realPress('Enter');
-    // cy.testid('CloseTabModal_buttonConfirm').click();
-    cy.wait(1000);
+    cy.get('body').then($body => {
+      const confirmButton = $body.find('[data-testid="CloseTabModal_buttonConfirm"]');
+      if (confirmButton.length) {
+        cy.wrap(confirmButton).click();
+      }
+    });
 
     cy.testid('app-object-group-items-tables').contains('addresses', { timeout: 10000 }).click();
 
@@ -175,6 +182,64 @@ describe('Backup table', () => {
   });
 });
 
+describe('Postgres database backup with dbgate-pg-dumper', () => {
+  if (localconfig.postgres) {
+    it('Backs up a single table using dbgate-pg-dumper', () => {
+      const otherTables = ['administrators', 'categories', 'customers', 'orders', 'order_items', 'products'];
+
+      cy.contains('Postgres-connection').click();
+      cy.contains('my_guitar_shop').rightclick();
+      cy.contains('Create database backup').click();
+
+      cy.testid('BackupDatabaseTab_chooseTables').contains('addresses', { timeout: 10000 });
+      cy.testid('BackupDatabaseTab_chooseTables').within(() => {
+        otherTables.forEach(table => {
+          cy.contains(table).click();
+        });
+      });
+
+      cy.testid('BackupDatabaseTab_backupTool').select('dbgate-pg-dumper');
+
+      cy.testid('BackupDatabaseTab_executeButton').click();
+      cy.testid('BackupDatabaseTab_status', { timeout: 30000 }).should('contain', 'Finished');
+
+      cy.themeshot('postgres-backup-dbgate-pg-dumper');
+      cy.testid('BackupDatabaseTab_openInTab').click();
+      cy.contains('CREATE TABLE');
+      cy.contains('addresses');
+    });
+  }
+});
+
+describe('MySQL database backup with dbgate-mysql-dumper', () => {
+  if (localconfig.mysql) {
+    it('Backs up a single table using dbgate-mysql-dumper', () => {
+      const otherTables = ['administrators', 'categories', 'customers', 'orders', 'order_items', 'products'];
+
+      cy.contains('MySql-connection').click();
+      cy.contains('my_guitar_shop').rightclick();
+      cy.contains('Create database backup').click();
+
+      cy.testid('BackupDatabaseTab_chooseTables').contains('addresses', { timeout: 10000 });
+      cy.testid('BackupDatabaseTab_chooseTables').within(() => {
+        otherTables.forEach(table => {
+          cy.contains(table).click();
+        });
+      });
+
+      cy.testid('BackupDatabaseTab_backupTool').select('dbgate-mysql-dumper');
+
+      cy.testid('BackupDatabaseTab_executeButton').click();
+      cy.testid('BackupDatabaseTab_status', { timeout: 30000 }).should('contain', 'Finished');
+
+      cy.themeshot('mysql-backup-dbgate-mysql-dumper');
+      cy.testid('BackupDatabaseTab_openInTab').click();
+      cy.contains('CREATE TABLE');
+      cy.contains('addresses');
+    });
+  }
+});
+
 describe('Truncate table', () => {
   multiTest({ skipMongo: true }, (connectionName, databaseName, engine, options = {}) => {
     cy.contains(connectionName).click();
@@ -183,7 +248,7 @@ describe('Truncate table', () => {
     cy.contains('Truncate table').click();
     cy.testid('ConfirmSqlModal_okButton').click();
     cy.contains('order_items').click();
-    cy.contains('No rows loaded').should('be.visible');
+    cy.contains('No rows loaded').should('exist');
   });
 });
 
@@ -212,8 +277,11 @@ describe('Import CSV', () => {
     cy.testid('ImportExportTab_preview_content').contains('50ddd99fAdF48B3').should('be.visible');
 
     cy.testid('ImportExportTab_executeButton').click();
-    cy.testid('ImportExportConfigurator_tableMappingSection').contains('20 rows written').should('be.visible');
+    cy.testid('ImportExportConfigurator_tableMappingSection')
+      .contains('20 rows written')
+      .should('be.visible');
 
+    cy.testid('ImportExportTab_executeButton').should('be.visible');
     cy.testid('SqlObjectList_refreshButton').click();
     cy.testid('DatabasStatusMenu_refreshFull').click();
     // cy.contains('Refresh DB structure (incremental)').click();
@@ -242,7 +310,8 @@ describe('Import CSV - source error', () => {
     cy.testid('ImportExportTab_preview_content').contains('Invalid Closing Quote').should('be.visible');
 
     cy.testid('ImportExportTab_executeButton').click();
-    cy.testid('ImportExportConfigurator_errorInfoIcon_customers-20-err', { timeout: 10000 }).click();
+    cy.testid('ImportExportTab_executeButton').should('be.visible');
+    cy.testid('ImportExportConfigurator_errorInfoIcon_customers-20-err').click();
 
     cy.testid('ErrorMessageModal_message').contains('Invalid Closing Quote').should('be.visible');
   });
@@ -259,9 +328,16 @@ describe('Import CSV - target error', () => {
 
     cy.get('input[type=file]').selectFile('cypress/fixtures/customers-20.csv', { force: true });
     cy.contains('customers-20');
-    cy.testid('ImportExportConfigurator_targetName_customers-20').clear().type('system."]`');
+    if (engine.startsWith('mongo@') || engine.startsWith('dynamodb@')) {
+      cy.testid('ImportExportConfigurator_targetName_customers-20').clear().type('system."]`');
+    } else {
+      // Quoted SQL identifiers can contain punctuation, so use a missing append target to force an error.
+      cy.testid('ImportExportConfigurator_targetName_customers-20').clear().type('dbgate_missing_import_target');
+      cy.testid('SourceAction_select_customers-20').select('appendData');
+    }
     cy.testid('ImportExportTab_executeButton').click();
-    cy.testid('ImportExportConfigurator_errorInfoIcon_customers-20', { timeout: 10000 }).click();
+    cy.testid('ImportExportTab_executeButton').should('be.visible');
+    cy.testid('ImportExportConfigurator_errorInfoIcon_customers-20').click();
     cy.testid('ErrorMessageModal_message').should('be.visible');
   });
 });

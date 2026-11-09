@@ -12,10 +12,31 @@
   import ConfirmModal from '../modals/ConfirmModal.svelte';
   import hasPermission from '../utility/hasPermission';
   import CheckboxField from '../forms/CheckboxField.svelte';
-  import { lockedDatabaseMode } from '../stores';
+  import { lockedDatabaseMode, tabGroupShowServerName, toolbarPosition } from '../stores';
+  import { getUsageAnalyticsConsent, setUsageAnalyticsConsent } from '../utility/usageAnalytics';
+  import { useConfig, useSettings } from '../utility/metadataLoaders';
 
   const electron = getElectron();
   let restartWarning = false;
+  let usageAnalyticsConsent = getUsageAnalyticsConsent() === true;
+  const config = useConfig();
+  const settings = useSettings();
+  $: analyticsEnvironmentManaged = typeof $config?.usageAnalyticsConsentOverride === 'boolean';
+  $: analyticsPolicy = analyticsEnvironmentManaged
+    ? $config.usageAnalyticsConsentOverride
+      ? 'enabled'
+      : 'disabled'
+    : $config?.storageDatabase
+    ? $settings?.['storage.usageAnalytics']
+    : null;
+  $: analyticsManaged = analyticsPolicy === 'enabled' || analyticsPolicy === 'disabled';
+  $: usageAnalyticsConsent = analyticsManaged ? analyticsPolicy === 'enabled' : getUsageAnalyticsConsent() === true;
+
+  function updateUsageAnalyticsConsent(consent: boolean) {
+    if (analyticsManaged) return;
+    usageAnalyticsConsent = consent;
+    setUsageAnalyticsConsent(consent);
+  }
 </script>
 
 <div class="wrapper">
@@ -104,6 +125,35 @@
     />
   </FormFieldTemplateLarge>
 
+  <div class="heading">{_t('settings.privacy', { defaultMessage: 'Privacy' })}</div>
+  <FormFieldTemplateLarge
+    label={_t('settings.usageAnalytics', { defaultMessage: 'Send anonymous usage analytics' })}
+    type="checkbox"
+    labelProps={{ onClick: () => updateUsageAnalyticsConsent(!usageAnalyticsConsent) }}
+  >
+    <CheckboxField
+      checked={usageAnalyticsConsent}
+      disabled={analyticsManaged}
+      on:change={e => updateUsageAnalyticsConsent(e.target['checked'])}
+      data-testid="GeneralSettings_usageAnalytics"
+    />
+  </FormFieldTemplateLarge>
+  {#if analyticsManaged}
+    <div class="analyticsDescription" data-testid="GeneralSettings_usageAnalyticsManaged">
+      {analyticsEnvironmentManaged
+        ? _t('settings.usageAnalytics.environmentManaged', {
+            defaultMessage: 'Managed by the USAGE_ANALYTICS environment variable.',
+          })
+        : _t('settings.usageAnalytics.managed', { defaultMessage: 'Managed by your team administrator.' })}
+    </div>
+  {/if}
+  <div class="analyticsDescription">
+    {_t('settings.usageAnalytics.description', {
+      defaultMessage:
+        'Share anonymous feature usage, application version, platform, language, edition, and country. SQL, connection details, and user-created names are never sent.',
+    })}
+  </div>
+
   <div class="heading">{_t('settings.appearance', { defaultMessage: 'Appearance' })}</div>
 
   {#if electron}
@@ -126,33 +176,49 @@
     {/if}
   {/if}
 
-  <FormCheckboxField
-    name="tabGroup.showServerName"
+  <FormFieldTemplateLarge
     label={_t('settings.tabGroup.showServerName', {
       defaultMessage: 'Show server name alongside database name in title of the tab group',
     })}
-    defaultValue={false}
-    disabled={!hasPermission('settings/change')}
-  />
+    type="checkbox"
+    labelProps={{
+      onClick: () => {
+        if (!electron || hasPermission('settings/change')) $tabGroupShowServerName = !$tabGroupShowServerName;
+      },
+    }}
+  >
+    <CheckboxField
+      checked={$tabGroupShowServerName}
+      disabled={!!electron && !hasPermission('settings/change')}
+      on:change={e => ($tabGroupShowServerName = e.target['checked'])}
+      data-testid="GeneralSettings_showServerName"
+    />
+  </FormFieldTemplateLarge>
 
-  <FormSelectField
+  <FormFieldTemplateLarge
     label={_t('settings.other.toolBarPosition', { defaultMessage: 'Tool bar position' })}
-    name="settings.toolbarPosition"
-    isNative
-    defaultValue="top"
-    options={[
-      {
-        value: 'top',
-        label: _t('settings.other.toolBarPosition.top', {
-          defaultMessage: 'Top',
-        }),
-      },
-      {
-        value: 'bottom',
-        label: _t('settings.other.toolBarPosition.bottom', { defaultMessage: 'Bottom' }),
-      },
-    ]}
-  />
+    type="combo"
+  >
+    <SelectField
+      isNative
+      data-testid="GeneralSettings_toolbarPosition"
+      defaultValue="top"
+      value={$toolbarPosition}
+      options={[
+        {
+          value: 'top',
+          label: _t('settings.other.toolBarPosition.top', {
+            defaultMessage: 'Top',
+          }),
+        },
+        {
+          value: 'bottom',
+          label: _t('settings.other.toolBarPosition.bottom', { defaultMessage: 'Bottom' }),
+        },
+      ]}
+      on:change={e => ($toolbarPosition = e.detail)}
+    />
+  </FormFieldTemplateLarge>
 </div>
 
 <style>
@@ -165,5 +231,12 @@
 
   .wrapper :global(select) {
     max-width: 400px;
+  }
+
+  .analyticsDescription {
+    color: var(--theme-generic-font-grayed);
+    margin: calc(-1 * var(--dim-large-form-margin) + 5px) var(--dim-large-form-margin)
+      var(--dim-large-form-margin);
+    max-width: 650px;
   }
 </style>

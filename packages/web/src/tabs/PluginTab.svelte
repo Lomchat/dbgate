@@ -3,7 +3,8 @@
 </script>
 
 <script lang="ts">
-  import compareVersions from 'compare-versions';
+  import { trackUsage } from '../utility/usageAnalytics';
+  import { compareVersions } from 'compare-versions';
   import FormStyledButton from '../buttons/FormStyledButton.svelte';
   import Markdown from '../elements/Markdown.svelte';
   import { extractPluginAuthor, extractPluginIcon } from '../plugins/manifestExtractors';
@@ -22,12 +23,15 @@
   $: isPackaged = $info?.isPackaged;
 
   const handleInstall = async () => {
+    trackUsage({ feature: 'plugins', action: 'install', tab: 'plugin', param: packageName });
     apiCall('plugins/install', { packageName });
   };
   const handleUninstall = async () => {
+    trackUsage({ feature: 'plugins', action: 'uninstall', tab: 'plugin', param: packageName });
     apiCall('plugins/uninstall', { packageName });
   };
   const handleUpgrade = async () => {
+    trackUsage({ feature: 'plugins', action: 'upgrade', tab: 'plugin', param: packageName });
     apiCall('plugins/upgrade', { packageName });
   };
 

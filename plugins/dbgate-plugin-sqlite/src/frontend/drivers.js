@@ -1,6 +1,6 @@
 // @ts-check
 
-const { driverBase } = global.DBGATE_PACKAGES['dbgate-tools'];
+const { driverBase, __t } = global.DBGATE_PACKAGES['dbgate-tools'];
 const Dumper = require('./Dumper');
 const { sqliteSplitterOptions, noSplitSplitterOptions } = require('dbgate-query-splitter/lib/options');
 const sqlLiteIcon = '<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="sqlite-original-a" x1="-15.615" x2="-6.741" y1="-9.108" y2="-9.108" gradientTransform="rotate(90 -90.486 64.634) scale(9.2712)" gradientUnits="userSpaceOnUse"><stop stop-color="#95d7f4" offset="0"/><stop stop-color="#0f7fcc" offset=".92"/><stop stop-color="#0f7fcc" offset="1"/></linearGradient></defs><path d="M69.5 99.176c-.059-.73-.094-1.2-.094-1.2S67.2 83.087 64.57 78.642c-.414-.707.043-3.594 1.207-7.88.68 1.169 3.54 6.192 4.118 7.81.648 1.824.78 2.347.78 2.347s-1.57-8.082-4.144-12.797a162.286 162.286 0 012.004-6.265c.973 1.71 3.313 5.859 3.828 7.3.102.293.192.543.27.774.023-.137.05-.274.074-.414-.59-2.504-1.75-6.86-3.336-10.082 3.52-18.328 15.531-42.824 27.84-53.754H16.9c-5.387 0-9.789 4.406-9.789 9.789v88.57c0 5.383 4.406 9.789 9.79 9.789h52.897a118.657 118.657 0 01-.297-14.652" fill="#0b7fcc"/><path d="M65.777 70.762c.68 1.168 3.54 6.188 4.117 7.809.649 1.824.781 2.347.781 2.347s-1.57-8.082-4.144-12.797a164.535 164.535 0 012.004-6.27c.887 1.567 2.922 5.169 3.652 6.872l.082-.961c-.648-2.496-1.633-5.766-2.898-8.328 3.242-16.871 13.68-38.97 24.926-50.898H16.899a6.94 6.94 0 00-6.934 6.933v82.11c17.527-6.731 38.664-12.88 56.855-12.614-.672-2.605-1.441-4.96-2.25-6.324-.414-.707.043-3.597 1.207-7.879" fill="url(#sqlite-original-a)"/><path d="M115.95 2.781c-5.5-4.906-12.164-2.933-18.734 2.899a44.347 44.347 0 00-2.914 2.859c-11.25 11.926-21.684 34.023-24.926 50.895 1.262 2.563 2.25 5.832 2.894 8.328.168.64.32 1.242.442 1.754.285 1.207.437 1.996.437 1.996s-.101-.383-.515-1.582c-.078-.23-.168-.484-.27-.773-.043-.125-.105-.274-.172-.434-.734-1.703-2.765-5.305-3.656-6.867-.762 2.25-1.437 4.36-2.004 6.265 2.578 4.715 4.149 12.797 4.149 12.797s-.137-.523-.782-2.347c-.578-1.621-3.441-6.64-4.117-7.809-1.164 4.281-1.625 7.172-1.207 7.88.809 1.362 1.574 3.722 2.25 6.323 1.524 5.867 2.586 13.012 2.586 13.012s.031.469.094 1.2a118.653 118.653 0 00.297 14.651c.504 6.11 1.453 11.363 2.664 14.172l.828-.449c-1.781-5.535-2.504-12.793-2.188-21.156.48-12.793 3.422-28.215 8.856-44.289 9.191-24.27 21.938-43.738 33.602-53.035-10.633 9.602-25.023 40.684-29.332 52.195-4.82 12.891-8.238 24.984-10.301 36.574 3.55-10.863 15.047-15.53 15.047-15.53s5.637-6.958 12.227-16.888c-3.95.903-10.43 2.442-12.598 3.352-3.2 1.344-4.067 1.8-4.067 1.8s10.371-6.312 19.27-9.171c12.234-19.27 25.562-46.648 12.141-58.621" fill="#003956"/></svg>';
@@ -24,7 +24,11 @@ const dialect = {
   allowMultipleValuesInsert: true,
   dropColumnDependencies: ['indexes', 'primaryKey', 'uniques'],
   quoteIdentifier(s) {
-    return `[${s}]`;
+    const name = String(s);
+    // SQLite has no escape for ] inside [...] - such names are quoted with backticks (doubled when
+    // contained in the name), which, unlike "...", are never taken for a string literal
+    if (name.includes(']')) return '`' + name.replace(/`/g, '``') + '`';
+    return `[${name}]`;
   },
   anonymousPrimaryKey: true,
   requireStandaloneSelectForScopeIdentity: true,
@@ -64,11 +68,94 @@ const sqliteDriverBase = {
   icon: sqlLiteIcon,
 };
 
+/**
+ * Built-in backup and restore through dbgate-sqlite-dumper, shared by the SQLite and libSQL drivers.
+ * @type {Partial<import('dbgate-types').EngineDriver>}
+ */
+const sqliteDumperSupport = {
+  supportsNodejsBackup: true,
+  supportsNodejsRestore: true,
+  nodejsBackupTool: 'dbgate-sqlite-dumper',
+  nodejsRestoreTool: 'dbgate-sqlite-dumper',
+  getNativeOperationFormArgs(operation) {
+    if (operation == 'backup') {
+      return [
+        {
+          type: 'select',
+          label: __t('sqliteDriver.backupTool', { defaultMessage: 'Backup tool' }),
+          name: 'backupTool',
+          default: 'dbgate-sqlite-dumper',
+          testId: 'BackupDatabaseTab_backupTool',
+          options: [{ name: 'dbgate-sqlite-dumper', value: 'dbgate-sqlite-dumper' }],
+        },
+        {
+          type: 'checkbox',
+          label: __t('sqliteDriver.dataOnly', { defaultMessage: 'Dump only data (without structure)' }),
+          name: 'dataOnly',
+          testId: 'BackupDatabaseTab_dataOnly',
+          default: false,
+          disabledFn: (values) => values.schemaOnly,
+        },
+        {
+          type: 'checkbox',
+          label: __t('sqliteDriver.schemaOnly', { defaultMessage: 'Dump schema only (no data)' }),
+          name: 'schemaOnly',
+          testId: 'BackupDatabaseTab_schemaOnly',
+          default: false,
+          disabledFn: (values) => values.dataOnly,
+        },
+        {
+          type: 'checkbox',
+          label: __t('sqliteDriver.includeDropStatements', {
+            defaultMessage: 'Include DROP statements before creating objects',
+          }),
+          name: 'includeDropStatements',
+          testId: 'BackupDatabaseTab_includeDropStatements',
+          default: false,
+        },
+        {
+          type: 'checkbox',
+          label: __t('sqliteDriver.includeDatabaseSettings', {
+            defaultMessage: 'Include user_version and application_id',
+          }),
+          name: 'includeDatabaseSettings',
+          testId: 'BackupDatabaseTab_includeDatabaseSettings',
+          default: true,
+        },
+        {
+          type: 'checkbox',
+          label: __t('sqliteDriver.preserveRowids', {
+            defaultMessage: 'Preserve rowids of tables without INTEGER PRIMARY KEY',
+          }),
+          name: 'preserveRowids',
+          testId: 'BackupDatabaseTab_preserveRowids',
+          default: false,
+          disabledFn: (values) => values.schemaOnly,
+        },
+      ];
+    }
+    if (operation == 'restore') {
+      return [
+        {
+          type: 'select',
+          label: __t('sqliteDriver.restoreTool', { defaultMessage: 'Restore tool' }),
+          name: 'restoreTool',
+          default: 'dbgate-sqlite-dumper',
+          testId: 'RestoreDatabaseTab_restoreTool',
+          options: [{ name: 'dbgate-sqlite-dumper', value: 'dbgate-sqlite-dumper' }],
+        },
+      ];
+    }
+    return null;
+  },
+};
+
 /** @type {import('dbgate-types').EngineDriver} */
 const driver = {
   ...sqliteDriverBase,
   engine: 'sqlite@dbgate-plugin-sqlite',
   title: 'SQLite',
+  ...sqliteDumperSupport,
   showConnectionField: (field, values) => field == 'databaseFile' || field == 'isReadOnly',
   beforeConnectionSave: (connection) => ({
     ...connection,
@@ -85,6 +172,9 @@ const libsqlDriver = {
   ...sqliteDriverBase,
   engine: 'libsql@dbgate-plugin-sqlite',
   title: 'LibSQL',
+  ...sqliteDumperSupport,
+  // A libSQL database reached over a URL is not supported by the built-in dumper yet.
+  supportsNodejsDumperForConnection: (connection) => connection?.authType == 'file' && !!connection?.databaseFile,
   authTypeLabel: 'Target type',
   authTypeFirst: true,
   premiumOnly: true,
@@ -109,4 +199,36 @@ const libsqlDriver = {
   // isElectronOnly: true,
 };
 
-module.exports = [driver, libsqlDriver];
+/** @type {import('dbgate-types').EngineDriver} */
+const cloudflareD1Driver = {
+  ...sqliteDriverBase,
+  engine: 'cloudflare-d1@dbgate-plugin-sqlite',
+  title: 'Cloudflare D1',
+  icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#F38020"><path d="M16.5088 16.8447c.1475-.5068.0908-.9707-.1553-1.3154-.2246-.3164-.6045-.499-1.0615-.5205l-8.6592-.1123a.1559.1559 0 0 1-.1333-.0713c-.0283-.042-.0351-.0986-.021-.1553.0278-.084.1123-.1484.2036-.1562l8.7359-.1123c1.0351-.0489 2.1601-.8868 2.5537-1.9136l.499-1.3013c.0215-.0561.0293-.1128.0147-.168-.5625-2.5463-2.835-4.4453-5.5499-4.4453-2.5039 0-4.6284 1.6177-5.3876 3.8614-.4927-.3658-1.1187-.5625-1.794-.499-1.2026.119-2.1665 1.083-2.2861 2.2856-.0283.31-.0069.6128.0635.894C1.5683 13.171 0 14.7754 0 16.752c0 .1748.0142.3515.0352.5273.0141.083.0844.1475.1689.1475h15.9814c.0909 0 .1758-.0645.2032-.1553l.12-.4268zm2.7568-5.5634c-.0771 0-.1611 0-.2383.0112-.0566 0-.1054.0415-.127.0976l-.3378 1.1744c-.1475.5068-.0918.9707.1543 1.3164.2256.3164.6055.498 1.0625.5195l1.8437.1133c.0557 0 .1055.0263.1329.0703.0283.043.0351.1074.0214.1562-.0283.084-.1132.1485-.204.1553l-1.921.1123c-1.041.0488-2.1582.8867-2.5527 1.914l-.1406.3585c-.0283.0713.0215.1416.0986.1416h6.5977c.0771 0 .1474-.0489.169-.126.1122-.4082.1757-.837.1757-1.2803 0-2.6025-2.125-4.727-4.7344-4.727"/></svg>',
+  premiumOnly: true,
+  readOnlySessions: true,
+  supportsTransactions: false,
+  supportedCreateDatabase: false,
+  // Same backup and restore options as SQLite. The restore itself is D1's own (backend/d1Restore.js):
+  // D1 refuses a dump's transaction statements, so the dump is sent in batches, each of which D1
+  // runs as a transaction.
+  ...sqliteDumperSupport,
+  showConnectionField: (field) =>
+    [
+      'cloudflareAccountId',
+      'cloudflareApiToken',
+      'cloudflareApiUrl',
+      'httpProxyUrl',
+      'httpProxyUser',
+      'httpProxyPassword',
+      'isReadOnly',
+    ].includes(field),
+  beforeConnectionSave: (connection) => ({
+    ...connection,
+    cloudflareDatabaseId: undefined,
+    singleDatabase: false,
+    defaultDatabase: undefined,
+  }),
+};
+
+module.exports = [driver, libsqlDriver, cloudflareD1Driver];

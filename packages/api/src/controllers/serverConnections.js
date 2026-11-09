@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const connections = require('./connections');
+const databaseConnections = require('./databaseConnections');
 const socket = require('../utility/socket');
 const { fork } = require('child_process');
 const _ = require('lodash');
@@ -14,6 +15,7 @@ const {
   hasPermission,
   loadDatabasePermissionsFromRequest,
   getDatabasePermissionRole,
+  testStandardPermission,
 } = require('../utility/hasPermission');
 const { MissingCredentialsError } = require('../utility/exceptions');
 const pipeForkLogs = require('../utility/pipeForkLogs');
@@ -21,6 +23,13 @@ const { getLogger, extractErrorLogData } = require('dbgate-tools');
 const { sendToAuditLog } = require('../utility/auditlog');
 
 const logger = getLogger('serverConnection');
+
+const SERVER_CHAT_SUPPORTED_ENGINES = new Set([
+  'mssql@dbgate-plugin-mssql',
+  'postgres@dbgate-plugin-postgres',
+  'mysql@dbgate-plugin-mysql',
+  'mariadb@dbgate-plugin-mysql',
+]);
 
 module.exports = {
   opened: [],
@@ -48,7 +57,8 @@ module.exports = {
   },
   handle_ping() {},
   handle_response(conid, { msgid, ...response }) {
-    const [resolve, reject] = this.requests[msgid];
+    const [resolve] = this.requests[msgid] || [];
+    if (!resolve) return;
     resolve(response);
     delete this.requests[msgid];
   },
@@ -70,6 +80,7 @@ module.exports = {
       if (connection.useRedirectDbLogin) {
         throw new MissingCredentialsError({ conid, redirectToDbLogin: true });
       }
+      const globalSettings = await config.getSettings();
       const subprocess = fork(
         global['API_PACKAGE'] || process.argv[1],
         [
@@ -80,6 +91,10 @@ module.exports = {
           // ...process.argv.slice(3),
         ],
         {
+          env: {
+            ...process.env,
+            NODE_NO_WARNINGS: globalSettings?.['behaviour.useDiagnosticTools'] === true ? '0' : '1',
+          },
           stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         }
       );
@@ -113,7 +128,7 @@ module.exports = {
         if (newOpened.disconnected) return;
         this.close(conid, false);
       });
-      subprocess.send({ msgtype: 'connect', ...connection, globalSettings: await config.getSettings() });
+      subprocess.send({ msgtype: 'connect', ...connection, globalSettings });
       return newOpened;
     });
     return res;
@@ -135,9 +150,18 @@ module.exports = {
         ...existing.status,
         name: 'error',
       };
+      for (const [msgid, request] of Object.entries(this.requests)) {
+        const [, reject, requestConid] = request;
+        if (requestConid == conid) {
+          reject(new Error('DBGM-00000 Server connection closed before the request completed'));
+          delete this.requests[msgid];
+        }
+      }
       socket.emitChanged(`server-status-changed`);
     }
   },
+
+  disconnect_access: 'self',
 
   disconnect_meta: true,
   async disconnect({ conid }, req) {
@@ -145,6 +169,8 @@ module.exports = {
     await this.close(conid, true);
     return { status: 'ok' };
   },
+
+  listDatabases_access: 'self',
 
   listDatabases_meta: true,
   async listDatabases({ conid }, req) {
@@ -185,6 +211,8 @@ module.exports = {
     return opened?.databases ?? [];
   },
 
+  version_access: 'self',
+
   version_meta: true,
   async version({ conid }, req) {
     await testConnectionPermission(conid, req);
@@ -192,16 +220,190 @@ module.exports = {
     return opened?.version ?? null;
   },
 
+  async requireServerChat(conid, req) {
+    if (!conid) {
+      throw new Error('DBGM-00000 Missing connection ID for server SQL chat');
+    }
+
+    const loadedPermissions = await loadPermissionsFromRequest(req);
+    await testConnectionPermission(conid, req, loadedPermissions);
+    await testStandardPermission('dbops/chat', req, loadedPermissions);
+    await testStandardPermission('dbops/query', req, loadedPermissions);
+
+    if (process.env.STORAGE_DATABASE && !hasPermission('all-databases', loadedPermissions)) {
+      throw new Error('DBGM-00000 Permission all-databases not granted for server SQL chat');
+    }
+    if (process.env.STORAGE_DATABASE && !hasPermission('all-tables', loadedPermissions)) {
+      throw new Error('DBGM-00000 Permission all-tables not granted for server SQL chat');
+    }
+
+    const connection = await connections.getCore({ conid });
+    if (!connection) {
+      throw new Error(`DBGM-00000 Connection with conid="${conid}" not found`);
+    }
+    if (connection.singleDatabase) {
+      throw new Error('DBGM-00000 Server SQL chat is not available for single-database connections');
+    }
+    if (!SERVER_CHAT_SUPPORTED_ENGINES.has(connection.engine)) {
+      throw new Error(
+        'DBGM-00000 Server SQL chat is only available for Microsoft SQL Server, PostgreSQL, MySQL and MariaDB connections'
+      );
+    }
+
+    const opened = await this.ensureOpened(conid);
+    if (!opened) {
+      throw new Error('DBGM-00000 Could not open connection for server SQL chat');
+    }
+
+    const readiness = await this.sendRequest(opened, { msgtype: 'serverChatReady' });
+    if (readiness.errorMessage) {
+      throw new Error(readiness.errorMessage);
+    }
+
+    return { connection, loadedPermissions, opened };
+  },
+
+  async loadChatDatabases(opened, filter = '') {
+    const response = await this.sendRequest(opened, { msgtype: 'chatDatabases', filter });
+    if (response.errorMessage) {
+      throw new Error(response.errorMessage);
+    }
+    return response.result ?? { databases: [], returnedCount: 0, totalMatches: 0, truncated: false };
+  },
+
+  async canonicalizeChatDatabase(opened, database) {
+    if (typeof database != 'string' || !database.trim()) {
+      throw new Error('DBGM-00000 Missing database name for server SQL chat');
+    }
+
+    const requestedDatabase = database.trim();
+    const response = await this.sendRequest(opened, {
+      msgtype: 'canonicalizeChatDatabase',
+      database: requestedDatabase,
+    });
+    if (response.errorMessage) {
+      throw new Error(response.errorMessage);
+    }
+    const canonicalDatabase = response.result?.database;
+    if (!canonicalDatabase) {
+      throw new Error(`DBGM-00000 Database "${requestedDatabase}" is not accessible to server SQL chat`);
+    }
+    return canonicalDatabase;
+  },
+
+  chatDatabases_access: 'self',
+
+  chatDatabases_meta: true,
+  async chatDatabases({ conid, filter = '' }, req) {
+    if (typeof filter != 'string') {
+      throw new Error('DBGM-00000 Server SQL chat database filter must be a string');
+    }
+    const { opened } = await this.requireServerChat(conid, req);
+
+    sendToAuditLog(req, {
+      category: 'serverop',
+      component: 'ServerConnectionsController',
+      event: 'databases.listForChat',
+      action: 'chatDatabases',
+      severity: 'info',
+      conid,
+      detail: filter.trim() || null,
+      message: 'Loaded accessible databases for server SQL chat',
+    });
+
+    return this.loadChatDatabases(opened, filter);
+  },
+
+  databaseStructure_access: 'self',
+
+  databaseStructure_meta: true,
+  async databaseStructure({ conid, database }, req) {
+    const { opened } = await this.requireServerChat(conid, req);
+    const canonicalDatabase = await this.canonicalizeChatDatabase(opened, database);
+
+    sendToAuditLog(req, {
+      category: 'serverop',
+      component: 'ServerConnectionsController',
+      event: 'dbStructure.getForChat',
+      action: 'databaseStructure',
+      severity: 'info',
+      conid,
+      database: canonicalDatabase,
+      message: `Loaded database structure for server SQL chat`,
+    });
+
+    await databaseConnections.ensureStructureLoaded(conid, canonicalDatabase);
+    return databaseConnections.structure({ conid, database: canonicalDatabase }, req);
+  },
+
+  queryDatabaseData_access: 'self',
+
+  queryDatabaseData_meta: true,
+  async queryDatabaseData({ conid, database, sql }, req) {
+    if (typeof sql != 'string' || !sql.trim()) {
+      throw new Error('DBGM-00000 Missing SQL for server database chat query');
+    }
+    const { opened } = await this.requireServerChat(conid, req);
+    const canonicalDatabase = await this.canonicalizeChatDatabase(opened, database);
+
+    sendToAuditLog(req, {
+      category: 'serverop',
+      component: 'ServerConnectionsController',
+      event: 'query.executeDatabaseForChat',
+      action: 'executeDatabaseSql',
+      severity: 'info',
+      conid,
+      database: canonicalDatabase,
+      detail: sql,
+      message: 'Executing AI-generated database SQL from server chat',
+    });
+
+    return databaseConnections.queryServerChatData({ conid, database: canonicalDatabase, sql });
+  },
+
+  queryData_access: 'self',
+
+  queryData_meta: true,
+  async queryData({ conid, sql }, req) {
+    if (typeof sql != 'string' || !sql.trim()) {
+      throw new Error('DBGM-00000 Missing SQL for server SQL chat');
+    }
+    const { opened } = await this.requireServerChat(conid, req);
+
+    logger.info({ conid }, 'DBGM-00000 Processing server SQL chat query');
+    sendToAuditLog(req, {
+      category: 'serverop',
+      component: 'ServerConnectionsController',
+      event: 'query.execute',
+      action: 'executeServerSql',
+      severity: 'info',
+      conid,
+      detail: sql,
+      message: 'Executing AI-generated server SQL',
+    });
+
+    return this.sendRequest(opened, { msgtype: 'queryData', sql });
+  },
+
+  serverStatus_access: 'self',
+
   serverStatus_meta: true,
-  async serverStatus() {
-    return {
+  async serverStatus(_params, req) {
+    const res = {
       ...this.closed,
       ..._.mapValues(_.keyBy(this.opened, 'conid'), 'status'),
     };
+    if (!req) return res;
+    // only the connections the caller may use
+    return _.pick(res, await connections.filterPermittedConnections(Object.keys(res), req));
   },
 
+  ping_access: 'self',
+
   ping_meta: true,
-  async ping({ conidArray, strmid }) {
+  async ping({ conidArray, strmid }, req) {
+    // only connections the caller may use are opened
+    conidArray = req ? await connections.filterPermittedConnections(conidArray, req) : conidArray;
     await Promise.all(
       _.uniq(conidArray).map(async conid => {
         const last = this.lastPinged[conid];
@@ -221,9 +423,14 @@ module.exports = {
         }
       })
     );
-    socket.setStreamIdFilter(strmid, { conid: [...(conidArray ?? []), '__model'] });
+    // the filter applies to the caller's own stream (the strmid header), not to any stream id
+    // from the body - that would let one user change the events another user's tab receives
+    const ownStrmid = req ? socket.getStrmidFromRequest(req) : strmid;
+    if (ownStrmid) socket.setStreamIdFilter(ownStrmid, { conid: [...(conidArray ?? []), '__model'] });
     return { status: 'ok' };
   },
+
+  refresh_access: 'self',
 
   refresh_meta: true,
   async refresh({ conid, keepOpen }, req) {
@@ -252,9 +459,18 @@ module.exports = {
     return res.result || null;
   },
 
+  createDatabase_access: { permission: 'dbops/createdb', connection: 'conid' },
+
   createDatabase_meta: true,
   async createDatabase({ conid, name }, req) {
     return this.sendDatabaseOp({ conid, msgtype: 'createDatabase', name }, req);
+  },
+
+  dropDatabase_access: {
+    permission: 'dbops/dropdb',
+    connection: 'conid',
+    database: 'name',
+    databaseRole: 'run_script',
   },
 
   dropDatabase_meta: true,
@@ -265,11 +481,13 @@ module.exports = {
   sendRequest(conn, message) {
     const msgid = crypto.randomUUID();
     const promise = new Promise((resolve, reject) => {
-      this.requests[msgid] = [resolve, reject];
+      this.requests[msgid] = [resolve, reject, conn.conid];
       try {
         conn.subprocess.send({ msgid, ...message });
       } catch (err) {
         logger.error(extractErrorLogData(err), 'DBGM-00122 Error sending request');
+        delete this.requests[msgid];
+        reject(err);
         this.close(conn.conid);
       }
     });
@@ -293,6 +511,8 @@ module.exports = {
     return res.result || null;
   },
 
+  serverSummary_access: 'self',
+
   serverSummary_meta: true,
   async serverSummary({ conid }, req) {
     await testConnectionPermission(conid, req);
@@ -300,11 +520,13 @@ module.exports = {
     return this.loadDataCore('serverSummary', { conid });
   },
 
+  listDatabaseProcesses_access: 'self',
+
   listDatabaseProcesses_meta: true,
   async listDatabaseProcesses(ctx, req) {
     const { conid } = ctx;
     // logger.info({ conid }, 'DBGM-00261 Listing processes of database server');
-    testConnectionPermission(conid, req);
+    await testConnectionPermission(conid, req);
 
     const opened = await this.ensureOpened(conid);
     if (!opened) {
@@ -315,10 +537,12 @@ module.exports = {
     return this.sendRequest(opened, { msgtype: 'listDatabaseProcesses' });
   },
 
+  killDatabaseProcess_access: 'self',
+
   killDatabaseProcess_meta: true,
   async killDatabaseProcess(ctx, req) {
     const { conid, pid } = ctx;
-    testConnectionPermission(conid, req);
+    await testConnectionPermission(conid, req);
 
     const opened = await this.ensureOpened(conid);
     if (!opened) {
@@ -328,6 +552,8 @@ module.exports = {
 
     return this.sendRequest(opened, { msgtype: 'killDatabaseProcess', pid });
   },
+
+  summaryCommand_access: 'self',
 
   summaryCommand_meta: true,
   async summaryCommand({ conid, command, row }, req) {

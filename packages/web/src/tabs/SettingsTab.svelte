@@ -21,7 +21,10 @@
   import SQLEditorSettings from '../settings/SQLEditorSettings.svelte';
   import AiSettingsTab from '../settings/AiSettingsTab.svelte';
   import hasPermission from '../utility/hasPermission';
+  import { useSettings } from '../utility/metadataLoaders';
   import { openedTabs } from '../stores';
+
+  const settings = useSettings();
 
   export let selectedItem = 'general';
   export let tabid = null;
@@ -34,7 +37,7 @@
     );
   }
 
-  const menuItems = [
+  $: menuItems = [
     {
       label: _t('settings.general', { defaultMessage: 'General' }),
       identifier: 'general',
@@ -121,7 +124,8 @@
         testid: 'settings-license',
       },
     hasPermission('settings/change') &&
-      isProApp() && {
+      isProApp() &&
+      !$settings?.['storage.disableAiFeatures'] && {
         label: _t('settings.AI', { defaultMessage: 'AI' }),
         identifier: 'ai',
         component: AiSettingsTab,

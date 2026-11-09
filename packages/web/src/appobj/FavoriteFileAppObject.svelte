@@ -1,22 +1,27 @@
 <script lang="ts" context="module">
   import AppObjectCore from './AppObjectCore.svelte';
+  import { getFavoriteKind, trackFavorite } from '../utility/favoriteUsage';
 
   export const extractKey = data => data.file;
 
-  export async function openFavorite(favorite) {
+  /** source says how the favorite was opened: list, startup, url_path, share_link or preview. */
+  export async function openFavorite(favorite, source = 'list') {
     const { icon, tabComponent, title, props, tabdata } = favorite;
     let tabdataNew = tabdata;
+    let loadFailed = false;
     if (props.savedFile) {
       const resp = await apiCall('files/load', {
         folder: props.savedFolder,
         file: props.savedFile,
         format: props.savedFormat,
       });
+      loadFailed = !!resp?.errorMessage;
       tabdataNew = {
         ...tabdata,
         editor: resp,
       };
     }
+    trackFavorite('open', favorite, { param: source, result: loadFailed ? 'error' : getFavoriteKind(favorite) });
     openNewTab(
       {
         title,
@@ -31,6 +36,7 @@
 
 <script lang="ts">
   import openNewTab from '../utility/openNewTab';
+  import { trackObjectTree } from './appObjectTools';
   import { copyTextToClipboard } from '../utility/clipboard';
   import { showModal } from '../modals/modalTools';
   import ConfirmModal from '../modals/ConfirmModal.svelte';
@@ -43,10 +49,12 @@
   const electron = getElectron();
 
   const editFavorite = () => {
+    trackObjectTree('edit', 'favorite_file');
     showModal(FavoriteModal, { editingData: data });
   };
 
   const editFavoriteJson = async () => {
+    trackObjectTree('edit_json', 'favorite_file');
     const resp = await apiCall('files/load', {
       folder: 'favorites',
       file: data.file,
@@ -69,13 +77,16 @@
   };
 
   const copyLink = () => {
+    trackObjectTree('copy_link', 'favorite_file');
     copyTextToClipboard(`${document.location.origin}#favorite=${data.urlPath}`);
   };
 
   const handleDelete = () => {
+    trackObjectTree('delete', 'favorite_file');
     showModal(ConfirmModal, {
       message: `Really delete favorite ${data.title}?`,
       onConfirm: () => {
+        trackFavorite('delete', data);
         apiCall('files/delete', { file: data.file, folder: 'favorites' });
       },
     });

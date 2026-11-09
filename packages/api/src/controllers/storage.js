@@ -37,4 +37,32 @@ module.exports = {
   async getUsedEngines() {
     return null;
   },
+
+  async readQueryHistory({ skip, limit, filter }, req) {
+    return null;
+  },
+
+  async writeQueryHistory({ data }, req) {
+    return null;
+  },
+
+  async storageReadRolePermissions(roleId) {
+    return [];
+  },
+
+  async readComplexRolePermissions(roleId, permissionType) {
+    return [];
+  },
+
+  async resolvePermissionConnectionIds(permissions) {
+    return permissions ?? [];
+  },
+
+  async storageCheckMcpConnectionAccess(req, conid) {
+    return false;
+  },
+
+  getMcpAuthProvider() {
+    return null;
+  },
 };

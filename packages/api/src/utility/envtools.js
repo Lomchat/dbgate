@@ -3,6 +3,10 @@ const _ = require('lodash');
 const { safeJsonParse, getDatabaseFileLabel } = require('dbgate-tools');
 const crypto = require('crypto');
 
+function isTrueValue(value) {
+  return [true, 1, '1', 'true'].includes(value);
+}
+
 function extractConnectionsFromEnv(env) {
   if (!env?.CONNECTIONS) {
     return null;
@@ -34,6 +38,7 @@ function extractConnectionsFromEnv(env) {
         : null),
     singleDatabase: !!env[`DATABASE_${id}`] || !!env[`FILE_${id}`] || !!env[`APISERVERURL1_${id}`],
     displayName: env[`LABEL_${id}`],
+    mcpEnabled: isTrueValue(env[`MCP_ENABLED_${id}`]),
     isReadOnly: env[`READONLY_${id}`],
     databases: env[`DBCONFIG_${id}`] ? safeJsonParse(env[`DBCONFIG_${id}`]) : null,
     allowedDatabases: env[`ALLOWED_DATABASES_${id}`]?.replace(/\|/g, '\n'),
@@ -96,6 +101,7 @@ function extractImportEntitiesFromEnv(env) {
     connectionEnvIdToDbId[conn.id_original] = conn.id;
   }
 
+  const roleNameRegex = /^ROLE_(.+)_NAME$/;
   const connectionsRegex = /^ROLE_(.+)_CONNECTIONS$/;
   const permissionsRegex = /^ROLE_(.+)_PERMISSIONS$/;
 
@@ -114,11 +120,16 @@ function extractImportEntitiesFromEnv(env) {
   const tablePermissionRegex = /^ROLE_(.+)_TABLES_(.+)_PERMISSION$/;
   const tableScopeRegex = /^ROLE_(.+)_TABLES_(.+)_SCOPE$/;
 
+  const teamFolderFolderRegex = /^ROLE_(.+)_TEAM_FOLDERS_(.+)_FOLDER$/;
+  const teamFolderPermissionsRegex = /^ROLE_(.+)_TEAM_FOLDERS_(.+)_PERMISSIONS$/;
+
   const roles = [];
   const role_connections = [];
   const role_permissions = [];
   const role_databases = [];
   const role_tables = [];
+  const team_folders = [];
+  const role_team_folders = [];
 
   // Permission name to ID mappings
   const databasePermissionMap = {
@@ -149,11 +160,67 @@ function extractImportEntitiesFromEnv(env) {
     collections: -9,
   };
 
-  // Collect database and table permissions data
+  // Collect database, table, and team folder permissions data
   const databasePermissions = {};
   const tablePermissions = {};
+  const teamFolderPermissions = {};
 
-  // First pass: collect all database and table permission data
+  // Role name can be defined indirectly, via ROLE_<roleKey>_NAME. Environment variable names are limited
+  // to letters, digits and underscores in many environments (Kubernetes, dotenv files, POSIX shells),
+  // so role names containing eg. dashes or dots (OIDC group names like team-a@company.com)
+  // cannot be used directly in the variable name. When ROLE_<roleKey>_NAME is not defined,
+  // roleKey itself is used as role name, as before.
+  // null prototype, so that role keys like constructor or __proto__ are not resolved to inherited members
+  const roleNamesByKey = Object.create(null);
+  for (const key in env) {
+    const match = key.match(roleNameRegex);
+    if (match) {
+      const roleName = env[key]?.trim();
+      if (roleName) {
+        roleNamesByKey[match[1]] = roleName;
+      }
+    }
+  }
+
+  const getOrCreateRole = roleKey => {
+    const roleName = roleNamesByKey[roleKey] ?? roleKey;
+    let role = roles.find(r => r.name === roleName);
+    if (!role) {
+      role = {
+        id: roles.length + 1,
+        name: roleName,
+        import_source_id: -1,
+      };
+      roles.push(role);
+    }
+    return role;
+  };
+
+  const getOrCreateTeamFolder = folderName => {
+    if (folderName === 'default') {
+      return {
+        id: -1,
+        folder_name: folderName,
+      };
+    }
+
+    let folder = team_folders.find(f => f.folder_name === folderName);
+    if (!folder) {
+      folder = {
+        id: team_folders.length + 1,
+        folder_name: folderName,
+      };
+      team_folders.push(folder);
+    }
+    return folder;
+  };
+
+  // create roles declared by ROLE_<roleKey>_NAME, even if they have no permissions assigned
+  for (const roleKey in roleNamesByKey) {
+    getOrCreateRole(roleKey);
+  }
+
+  // First pass: collect all database, table, and team folder permission data
   for (const key in env) {
     const dbConnMatch = key.match(dbConnectionRegex);
     const dbDatabasesMatch = key.match(dbDatabasesRegex);
@@ -169,6 +236,8 @@ function extractImportEntitiesFromEnv(env) {
     const tableTablesRegexMatch = key.match(tableTablesRegexRegex);
     const tablePermMatch = key.match(tablePermissionRegex);
     const tableScopeMatch = key.match(tableScopeRegex);
+    const teamFolderFolderMatch = key.match(teamFolderFolderRegex);
+    const teamFolderPermissionsMatch = key.match(teamFolderPermissionsRegex);
 
     // Database permissions
     if (dbConnMatch) {
@@ -251,23 +320,29 @@ function extractImportEntitiesFromEnv(env) {
       if (!tablePermissions[roleName][permId]) tablePermissions[roleName][permId] = {};
       tablePermissions[roleName][permId].scope = env[key];
     }
+
+    // Team folder permissions
+    if (teamFolderFolderMatch) {
+      const [, roleName, permId] = teamFolderFolderMatch;
+      if (!teamFolderPermissions[roleName]) teamFolderPermissions[roleName] = {};
+      if (!teamFolderPermissions[roleName][permId]) teamFolderPermissions[roleName][permId] = {};
+      teamFolderPermissions[roleName][permId].folder = env[key];
+    }
+    if (teamFolderPermissionsMatch) {
+      const [, roleName, permId] = teamFolderPermissionsMatch;
+      if (!teamFolderPermissions[roleName]) teamFolderPermissions[roleName] = {};
+      if (!teamFolderPermissions[roleName][permId]) teamFolderPermissions[roleName][permId] = {};
+      teamFolderPermissions[roleName][permId].permissions = env[key];
+    }
   }
 
   // Second pass: process roles, connections, and permissions
   for (const key in env) {
     const connMatch = key.match(connectionsRegex);
-    const permMatch = key.match(permissionsRegex);
+    const permMatch = key.match(teamFolderPermissionsRegex) ? null : key.match(permissionsRegex);
     if (connMatch) {
       const roleName = connMatch[1];
-      let role = roles.find(r => r.name === roleName);
-      if (!role) {
-        role = {
-          id: roles.length + 1,
-          name: roleName,
-          import_source_id: -1,
-        };
-        roles.push(role);
-      }
+      const role = getOrCreateRole(roleName);
       const connIds = env[key]
         .split(',')
         .map(id => id.trim())
@@ -285,15 +360,7 @@ function extractImportEntitiesFromEnv(env) {
     }
     if (permMatch) {
       const roleName = permMatch[1];
-      let role = roles.find(r => r.name === roleName);
-      if (!role) {
-        role = {
-          id: roles.length + 1,
-          name: roleName,
-          import_source_id: -1,
-        };
-        roles.push(role);
-      }
+      const role = getOrCreateRole(roleName);
       const permissions = env[key]
         .split(',')
         .map(p => p.trim())
@@ -310,15 +377,7 @@ function extractImportEntitiesFromEnv(env) {
 
   // Process database permissions
   for (const roleName in databasePermissions) {
-    let role = roles.find(r => r.name === roleName);
-    if (!role) {
-      role = {
-        id: roles.length + 1,
-        name: roleName,
-        import_source_id: -1,
-      };
-      roles.push(role);
-    }
+    const role = getOrCreateRole(roleName);
 
     for (const permId in databasePermissions[roleName]) {
       const perm = databasePermissions[roleName][permId];
@@ -342,15 +401,7 @@ function extractImportEntitiesFromEnv(env) {
 
   // Process table permissions
   for (const roleName in tablePermissions) {
-    let role = roles.find(r => r.name === roleName);
-    if (!role) {
-      role = {
-        id: roles.length + 1,
-        name: roleName,
-        import_source_id: -1,
-      };
-      roles.push(role);
-    }
+    const role = getOrCreateRole(roleName);
 
     for (const permId in tablePermissions[roleName]) {
       const perm = tablePermissions[roleName][permId];
@@ -378,6 +429,41 @@ function extractImportEntitiesFromEnv(env) {
     }
   }
 
+  // Process team folder permissions
+  for (const roleName in teamFolderPermissions) {
+    for (const permId in teamFolderPermissions[roleName]) {
+      const perm = teamFolderPermissions[roleName][permId];
+      const folderName = perm.folder?.trim();
+      const permissions = perm.permissions
+        ?.split(',')
+        .map(p => p.trim().toLowerCase())
+        .filter(p => p.length > 0);
+
+      if (!folderName || !permissions?.length) {
+        continue;
+      }
+
+      const allowRead = permissions.includes('read') ? 1 : 0;
+      const allowWrite = permissions.includes('write') ? 1 : 0;
+      const allowUse = permissions.includes('use') ? 1 : 0;
+
+      if (!allowRead && !allowWrite && !allowUse) {
+        continue;
+      }
+
+      const role = getOrCreateRole(roleName);
+      const teamFolder = getOrCreateTeamFolder(folderName);
+      role_team_folders.push({
+        role_id: role.id,
+        team_folder_id: teamFolder.id,
+        allow_read_files: allowRead,
+        allow_write_files: allowWrite,
+        allow_use_files: allowUse,
+        import_source_id: -1,
+      });
+    }
+  }
+
   if (connections.length == 0 && roles.length == 0) {
     return null;
   }
@@ -389,6 +475,8 @@ function extractImportEntitiesFromEnv(env) {
     role_permissions,
     role_databases,
     role_tables,
+    team_folders,
+    role_team_folders,
   };
 }
 
@@ -414,6 +502,14 @@ function createStorageFromEnvReplicatorItems(importEntities) {
       deleteMissing: true,
       deleteRestrictionColumns: ['import_source_id'],
       jsonArray: importEntities.roles,
+    },
+    {
+      name: 'team_folders',
+      findExisting: true,
+      createNew: true,
+      updateExisting: true,
+      matchColumns: ['folder_name'],
+      jsonArray: importEntities.team_folders,
     },
     {
       name: 'role_connections',
@@ -453,6 +549,16 @@ function createStorageFromEnvReplicatorItems(importEntities) {
       deleteMissing: true,
       matchColumns: ['role_id', 'id_original', 'import_source_id'],
       jsonArray: importEntities.role_tables,
+      deleteRestrictionColumns: ['import_source_id'],
+    },
+    {
+      name: 'role_team_folders',
+      findExisting: true,
+      createNew: true,
+      updateExisting: true,
+      deleteMissing: true,
+      matchColumns: ['role_id', 'team_folder_id', 'import_source_id'],
+      jsonArray: importEntities.role_team_folders,
       deleteRestrictionColumns: ['import_source_id'],
     },
   ];

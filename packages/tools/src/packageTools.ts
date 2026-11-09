@@ -3,6 +3,85 @@ import _camelCase from 'lodash/camelCase';
 import _isString from 'lodash/isString';
 import _isPlainObject from 'lodash/isPlainObject';
 
+const JS_IDENTIFIER_RE = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/;
+
+// ECMAScript reserved words, strict-mode keywords, and async-context keywords
+// that cannot be used as variable or function names in the generated scripts.
+// Sources: ECMA-262 §12.7.2 (reserved words), §12.7.3 (strict mode), §14 (contextual).
+const JS_RESERVED_WORDS = new Set([
+  // Keywords
+  'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'default',
+  'delete', 'do', 'else', 'export', 'extends', 'false', 'finally', 'for',
+  'function', 'if', 'import', 'in', 'instanceof', 'let', 'new', 'null', 'return',
+  'static', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'var',
+  'void', 'while', 'with', 'yield',
+  // Strict-mode reserved words
+  'implements', 'interface', 'package', 'private', 'protected', 'public',
+  // Async context keywords
+  'async', 'await',
+  // Future reserved
+  'enum',
+  'eval', 'arguments',
+]);
+
+export function isValidJsIdentifier(name: string): boolean {
+  return typeof name === 'string' && JS_IDENTIFIER_RE.test(name) && !JS_RESERVED_WORDS.has(name);
+}
+
+export function assertValidJsIdentifier(name: string, label: string): void {
+  if (!isValidJsIdentifier(name)) {
+    throw new Error(`DBGM-00431 Invalid ${label}: ${String(name).substring(0, 100)}`);
+  }
+}
+
+const VALID_PLUGIN_NAME_RE = /^dbgate-plugin-[a-zA-Z0-9_-]+$/;
+
+/**
+ * Tests whether a value is a canonical DbGate plugin package name (dbgate-plugin-<name>).
+ * By construction this rejects absolute paths, path traversal (..), path separators
+ * and scoped/@-names, none of which may ever be passed to require()/require.resolve().
+ */
+export function isValidPluginPackageName(packageName): boolean {
+  return typeof packageName === 'string' && VALID_PLUGIN_NAME_RE.test(packageName);
+}
+
+/**
+ * Asserts that packageName is a canonical DbGate plugin package name.
+ * Must be called before any code path that resolves or require()s a plugin by name,
+ * so that caller-supplied paths cannot be loaded as modules.
+ */
+export function assertValidPluginPackageName(packageName): string {
+  if (!isValidPluginPackageName(packageName)) {
+    throw new Error(`DBGM-00000 Invalid plugin package name: ${String(packageName).substring(0, 100)}`);
+  }
+  return packageName;
+}
+
+/**
+ * Validates a shell API function name.
+ * Allowed forms:
+ *   - "someFunctionName"  (plain identifier, resolved as dbgateApi.someFunctionName)
+ *   - "funcName@dbgate-plugin-xxx"  (namespaced, resolved as plugin.shellApi.funcName)
+ */
+export function assertValidShellApiFunctionName(functionName: string): void {
+  if (typeof functionName !== 'string') {
+    throw new Error('DBGM-00432 functionName must be a string');
+  }
+  const nsMatch = functionName.match(/^([^@]+)@([^@]+)$/);
+  if (nsMatch) {
+    if (!isValidJsIdentifier(nsMatch[1])) {
+      throw new Error(`DBGM-00433 Invalid function part in functionName: ${nsMatch[1].substring(0, 100)}`);
+    }
+    if (!isValidPluginPackageName(nsMatch[2])) {
+      throw new Error(`DBGM-00000 Invalid plugin package in functionName: ${nsMatch[2].substring(0, 100)}`);
+    }
+  } else {
+    if (!isValidJsIdentifier(functionName)) {
+      throw new Error(`DBGM-00435 Invalid functionName: ${functionName.substring(0, 100)}`);
+    }
+  }
+}
+
 export function extractShellApiPlugins(functionName, props): string[] {
   const res = [];
   const nsMatch = functionName.match(/^([^@]+)@([^@]+)/);
@@ -14,6 +93,9 @@ export function extractShellApiPlugins(functionName, props): string[] {
     if (nsMatchEngine) {
       res.push(nsMatchEngine[2]);
     }
+  }
+  for (const plugin of res) {
+    assertValidPluginPackageName(plugin);
   }
   return res;
 }
@@ -28,7 +110,8 @@ export function extractPackageName(name): string {
 }
 
 export function compileShellApiFunctionName(functionName) {
-  const nsMatch = functionName.match(/^([^@]+)@([^@]+)/);
+  assertValidShellApiFunctionName(functionName);
+  const nsMatch = functionName.match(/^([^@]+)@([^@]+)$/);
   if (nsMatch) {
     return `${_camelCase(nsMatch[2])}.shellApi.${nsMatch[1]}`;
   }
@@ -36,7 +119,8 @@ export function compileShellApiFunctionName(functionName) {
 }
 
 export function evalShellApiFunctionName(functionName, dbgateApi, requirePlugin) {
-  const nsMatch = functionName.match(/^([^@]+)@([^@]+)/);
+  assertValidShellApiFunctionName(functionName);
+  const nsMatch = functionName.match(/^([^@]+)@([^@]+)$/);
   if (nsMatch) {
     return requirePlugin(nsMatch[2]).shellApi[nsMatch[1]];
   }

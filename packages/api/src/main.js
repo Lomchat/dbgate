@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const fileUpload = require('express-fileupload');
 const http = require('http');
 const cors = require('cors');
-const getPort = require('get-port');
+const getPort = require('get-port').default;
 const path = require('path');
 const fs = require('fs/promises');
 
@@ -27,20 +27,27 @@ const auth = require('./controllers/auth');
 const uploads = require('./controllers/uploads');
 const plugins = require('./controllers/plugins');
 const files = require('./controllers/files');
+const { hasPermission, loadPermissionsFromRequest } = require('./utility/hasPermission');
+const { checkSecureFilePathsWithoutDirectory } = require('./utility/security');
 const scheduler = require('./controllers/scheduler');
 const queryHistory = require('./controllers/queryHistory');
 const cloud = require('./controllers/cloud');
 const teamFiles = require('./controllers/teamFiles');
+const mcpAdmin = require('./controllers/mcpAdmin');
+const codex = require('./controllers/codex');
+const usageAnalytics = require('./controllers/usageAnalytics');
+const mcp = require('./mcp');
 
 const onFinished = require('on-finished');
 const processArgs = require('./utility/processArgs');
 
-const { rundir, filesdir } = require('./utility/directories');
+const { rundir, filesdir, uploadsdir } = require('./utility/directories');
 const platformInfo = require('./utility/platformInfo');
 const getExpressPath = require('./utility/getExpressPath');
 const _ = require('lodash');
 const { getLogger } = require('dbgate-tools');
 const { getDefaultAuthProvider } = require('./auth/authProvider');
+const { isBasicAuthActive } = require('./auth/authCommon');
 const startCloudUpgradeTimer = require('./utility/cloudUpgrade');
 const { isProApp } = require('./utility/checkLicense');
 const { getHealthStatus, getHealthStatusSprinx } = require('./utility/healthStatus');
@@ -49,7 +56,7 @@ const { startCloudFiles } = require('./utility/cloudIntf');
 const logger = getLogger('main');
 
 function registerExpressStatic(app, publicDir) {
-  app.get([getExpressPath('/'), getExpressPath('/*.html')], async (req, res, next) => {
+  app.get([getExpressPath('/'), getExpressPath('/*file.html')], async (req, res, next) => {
     try {
       const relPath = req.path === getExpressPath('/') ? '/index.html' : req.path;
       const filePath = path.join(publicDir, relPath);
@@ -94,10 +101,19 @@ function start() {
   // console.log('process.argv', process.argv);
 
   const app = express();
+  app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+  // keep Express 4 behaviour - parse nested query strings (Express 5 defaults to 'simple')
+  app.set('query parser', 'extended');
 
   const server = http.createServer(app);
 
-  if (process.env.BASIC_AUTH && !process.env.STORAGE_DATABASE) {
+  if (process.env.BASIC_AUTH && process.env.STORAGE_DATABASE) {
+    logger.error(
+      'DBGM-00000 BASIC_AUTH cannot be used together with STORAGE_DATABASE, basic authentication is not enabled'
+    );
+  }
+
+  if (isBasicAuthActive()) {
     async function authorizer(username, password, cb) {
       try {
         const resp = await getDefaultAuthProvider().login(username, password);
@@ -146,6 +162,16 @@ function start() {
 
   app.get(getExpressPath('/stream'), async function (req, res) {
     const strmid = req.query.strmid;
+    // ids starting with "__" are reserved for events that must reach no browser tab (socket.js)
+    if (typeof strmid != 'string' || strmid.length == 0 || strmid.length > 100 || strmid.startsWith('__')) {
+      res.status(400).end();
+      return;
+    }
+    // a second connection would take over the stream of the browser tab using this id
+    if (socket.hasLiveSseResponse(strmid)) {
+      res.status(409).end();
+      return;
+    }
     res.set({
       'Cache-Control': 'no-cache',
       'Content-Type': 'text/event-stream',
@@ -158,7 +184,7 @@ function start() {
     res.write('retry: 10000\n\n');
     socket.addSseResponse(res, strmid);
     onFinished(req, () => {
-      socket.removeSseResponse(strmid);
+      socket.removeSseResponse(strmid, res);
     });
   });
 
@@ -175,11 +201,23 @@ function start() {
   });
 
   app.use(bodyParser.json({ limit: '50mb' }));
+  app.use(bodyParser.urlencoded({ extended: false }));
+
+  app.get(getExpressPath('/.well-known/oauth-protected-resource'), mcp.handleOAuthProtectedResourceMetadata);
+  app.get(getExpressPath('/.well-known/oauth-protected-resource/mcp'), mcp.handleOAuthProtectedResourceMetadata);
+  app.get(getExpressPath('/.well-known/oauth-authorization-server'), mcp.handleOAuthAuthorizationServerMetadata);
+  app.get(getExpressPath('/.well-known/openid-configuration'), mcp.handleOAuthAuthorizationServerMetadata);
+  app.get(getExpressPath('/authorize'), mcp.handleOAuthAuthorize);
+  app.post(getExpressPath('/token'), mcp.handleOAuthToken);
+  app.get(getExpressPath('/mcp/oauth/authorize'), mcp.handleOAuthAuthorize);
+  app.post(getExpressPath('/mcp/oauth/token'), mcp.handleOAuthToken);
+  app.post(getExpressPath('/mcp'), mcp.handleMcpRequest);
 
   app.use(
     getExpressPath('/uploads'),
     fileUpload({
-      limits: { fileSize: 4 * 1024 * 1024 },
+      useTempFiles: true,
+      tempFileDir: uploadsdir(),
     })
   );
 
@@ -190,6 +228,31 @@ function start() {
   // }
 
   app.use(getExpressPath('/runners/data'), express.static(rundir()));
+  // saved files (e.g. a backup download); the same read permission as files/load
+  app.use(getExpressPath('/files/data'), async (req, res, next) => {
+    try {
+      // only <folder>/<file> - express.static normalizes the path, so with '..', '.' or '\' in it
+      // a different file than the checked one would be served
+      const parts = decodeURIComponent(req.path).split('/').filter(Boolean);
+      const [folder, file] = parts;
+      const isSafePart = x => x != '.' && checkSecureFilePathsWithoutDirectory(x);
+      if (parts.length != 2 || !isSafePart(folder) || !isSafePart(file)) {
+        res.status(403).end();
+        return;
+      }
+      const loadedPermissions = await loadPermissionsFromRequest(req);
+      if (
+        !hasPermission(`files/${folder}/read`, loadedPermissions) ||
+        (await files.isDiskFileDenied(folder, file, req, loadedPermissions))
+      ) {
+        res.status(403).end();
+        return;
+      }
+      next();
+    } catch (err) {
+      res.status(400).end();
+    }
+  });
   app.use(getExpressPath('/files/data'), express.static(filesdir()));
 
   if (platformInfo.isDocker) {
@@ -271,6 +334,9 @@ function useAllControllers(app, electron) {
   useController(app, electron, '/cloud', cloud);
   useController(app, electron, '/team-files', teamFiles);
   useController(app, electron, '/rest-connections', restConnections);
+  useController(app, electron, '/mcp-admin', mcpAdmin);
+  useController(app, electron, '/codex', codex);
+  useController(app, electron, '/usage-analytics', usageAnalytics);
 }
 
 function setElectronSender(electronSender) {

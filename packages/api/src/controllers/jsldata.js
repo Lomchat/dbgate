@@ -1,16 +1,24 @@
-const { filterName } = require('dbgate-tools');
+const { filterName, getLogger, extractErrorLogData } = require('dbgate-tools');
+const logger = getLogger('jsldata');
 const fs = require('fs');
 const lineReader = require('line-reader');
 const _ = require('lodash');
 const { __ } = require('lodash/fp');
-const DatastoreProxy = require('../utility/DatastoreProxy');
+const DatastoreCache = require('../utility/DatastoreCache');
 const getJslFileName = require('../utility/getJslFileName');
+const { openJslFileForWrite, openJslFileForRead } = getJslFileName;
 const JsonLinesDatastore = require('../utility/JsonLinesDatastore');
 const requirePluginFunction = require('../utility/requirePluginFunction');
 const socket = require('../utility/socket');
+const { testStandardPermission } = require('../utility/hasPermission');
 const crypto = require('crypto');
 const dbgateApi = require('../shell');
 const { ChartProcessor } = require('dbgate-datalib');
+
+const datastoreCache = new DatastoreCache(
+  (jslid, formatterFunction) => new JsonLinesDatastore(getJslFileName(jslid), formatterFunction),
+  err => logger.error(extractErrorLogData(err), 'DBGM-00000 Error closing cached result reader')
+);
 
 function readFirstLine(file) {
   return new Promise((resolve, reject) => {
@@ -35,96 +43,11 @@ function readFirstLine(file) {
 }
 
 module.exports = {
-  datastores: {},
-
-  // closeReader(jslid) {
-  //   // console.log('CLOSING READER');
-  //   if (!this.openedReaders[jslid]) return Promise.resolve();
-  //   return new Promise((resolve, reject) => {
-  //     this.openedReaders[jslid].reader.close((err) => {
-  //       if (err) reject(err);
-  //       delete this.openedReaders[jslid];
-  //       resolve();
-  //     });
-  //   });
-  // },
-
-  // readLine(readerInfo) {
-  //   return new Promise((resolve, reject) => {
-  //     const { reader } = readerInfo;
-  //     if (!reader.hasNextLine()) {
-  //       resolve(null);
-  //       return;
-  //     }
-  //     reader.nextLine((err, line) => {
-  //       if (readerInfo.readedSchemaRow) readerInfo.readedDataRowCount += 1;
-  //       else readerInfo.readedSchemaRow = true;
-  //       if (err) reject(err);
-  //       resolve(line);
-  //     });
-  //   });
-  // },
-
-  // openReader(jslid) {
-  //   // console.log('OPENING READER');
-  //   // console.log(
-  //   //   'OPENING READER, LINES=',
-  //   //   fs.readFileSync(path.join(jsldir(), `${jslid}.jsonl`), 'utf-8').split('\n').length
-  //   // );
-  //   const file = getJslFileName(jslid);
-  //   return new Promise((resolve, reject) =>
-  //     lineReader.open(file, (err, reader) => {
-  //       if (err) reject(err);
-  //       const readerInfo = {
-  //         reader,
-  //         readedDataRowCount: 0,
-  //         readedSchemaRow: false,
-  //         isReading: true,
-  //       };
-  //       this.openedReaders[jslid] = readerInfo;
-  //       resolve(readerInfo);
-  //     })
-  //   );
-  // },
-
-  // async ensureReader(jslid, offset) {
-  //   if (this.openedReaders[jslid] && this.openedReaders[jslid].readedDataRowCount > offset) {
-  //     await this.closeReader(jslid);
-  //   }
-  //   let readerInfo = this.openedReaders[jslid];
-  //   if (!this.openedReaders[jslid]) {
-  //     readerInfo = await this.openReader(jslid);
-  //   }
-  //   readerInfo.isReading = true;
-  //   if (!readerInfo.readedSchemaRow) {
-  //     await this.readLine(readerInfo); // skip structure
-  //   }
-  //   while (readerInfo.readedDataRowCount < offset) {
-  //     await this.readLine(readerInfo);
-  //   }
-  //   return readerInfo;
-  // },
-
-  async ensureDatastore(jslid, formatterFunction) {
-    let datastore = this.datastores[jslid];
-    if (!datastore || datastore.formatterFunction != formatterFunction) {
-      if (datastore) {
-        datastore._closeReader();
-      }
-      datastore = new JsonLinesDatastore(getJslFileName(jslid), formatterFunction);
-      // datastore = new DatastoreProxy(getJslFileName(jslid));
-      this.datastores[jslid] = datastore;
-    }
-    return datastore;
-  },
-
   async closeDataStore(jslid) {
-    const datastore = this.datastores[jslid];
-    if (datastore) {
-      await datastore._closeReader();
-      delete this.datastores[jslid];
-    }
+    await datastoreCache.close(jslid);
   },
+
+  getInfo_access: 'user',
 
   getInfo_meta: true,
   async getInfo({ jslid }) {
@@ -147,17 +70,84 @@ module.exports = {
     }
   },
 
+  getRows_access: 'user',
+
   getRows_meta: true,
   async getRows({ jslid, offset, limit, filters, sort, formatterFunction }) {
-    const datastore = await this.ensureDatastore(jslid, formatterFunction);
-    return datastore.getRows(offset, limit, _.isEmpty(filters) ? null : filters, _.isEmpty(sort) ? null : sort);
+    const fileName = getJslFileName(jslid);
+    if (!fs.existsSync(fileName)) {
+      return [];
+    }
+    return datastoreCache.use(jslid, formatterFunction, datastore =>
+      datastore.getRows(offset, limit, _.isEmpty(filters) ? null : filters, _.isEmpty(sort) ? null : sort)
+    );
   },
+
+  exists_access: 'user',
 
   exists_meta: true,
   async exists({ jslid }) {
     const fileName = getJslFileName(jslid);
     return fs.existsSync(fileName);
   },
+
+  streamRows_access: 'user',
+
+  streamRows_meta: {
+    method: 'get',
+    raw: true,
+  },
+  async streamRows(req, res) {
+    const { jslid } = req.query;
+    if (!jslid) {
+      res.status(400).json({ apiErrorMessage: 'Missing jslid' });
+      return;
+    }
+
+    // getJslFileName confines the resolved path to the managed data directories for every
+    // jslid form, so this route no longer needs an allow-list check of its own - having one
+    // here and nowhere else is how the write routes below ended up unprotected.
+    //
+    // The stream is then built on the descriptor openJslFileForRead vouched for, not on the
+    // path. Handing the approved name back to createReadStream would read whatever that name
+    // resolves to by the time the stream opens it, which is not what was approved.
+    let handle;
+    try {
+      handle = await openJslFileForRead(jslid);
+    } catch (err) {
+      if (err?.code == 'ENOENT') {
+        res.status(404).json({ apiErrorMessage: 'File not found' });
+        return;
+      }
+      logger.warn({ jslid }, 'DBGM-00255 streamRows rejected path outside allowed roots');
+      res.status(403).json({ apiErrorMessage: 'Forbidden path' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-cache');
+    const stream = fs.createReadStream(null, { fd: handle.fd, encoding: 'utf-8', autoClose: false });
+
+    const closeHandle = () => handle.close().catch(() => {});
+    stream.on('close', closeHandle);
+
+    req.on('close', () => {
+      stream.destroy();
+    });
+
+    stream.on('error', err => {
+      logger.error(extractErrorLogData(err), 'DBGM-00256 Error streaming JSONL file');
+      if (!res.headersSent) {
+        res.status(500).json({ apiErrorMessage: 'Stream error' });
+      } else {
+        res.end();
+      }
+    });
+
+    stream.pipe(res);
+  },
+
+  getStats_access: 'user',
 
   getStats_meta: true,
   getStats({ jslid }) {
@@ -172,146 +162,176 @@ module.exports = {
     return {};
   },
 
+  loadFieldValues_access: 'user',
+
   loadFieldValues_meta: true,
   async loadFieldValues({ jslid, field, search, formatterFunction }) {
-    const datastore = await this.ensureDatastore(jslid, formatterFunction);
     const res = new Set();
-    await datastore.enumRows(row => {
-      if (!filterName(search, row[field])) return true;
-      res.add(row[field]);
-      return res.size < 100;
-    });
+    await datastoreCache.use(jslid, formatterFunction, datastore =>
+      datastore.enumRows(row => {
+        if (!filterName(search, row[field])) return true;
+        res.add(row[field]);
+        return res.size < 100;
+      })
+    );
     // @ts-ignore
     return [...res].map(value => ({ value }));
   },
 
   async notifyChangedStats(stats) {
-    // console.log('SENDING STATS', JSON.stringify(stats));
-    const datastore = this.datastores[stats.jslid];
-    if (datastore) await datastore.notifyChanged();
+    await datastoreCache.use(stats.jslid, undefined, datastore => datastore.notifyChanged(), true);
     socket.emit(`jsldata-stats-${stats.jslid}`, stats);
-
-    // const readerInfo = this.openedReaders[stats.jslid];
-    // if (readerInfo && readerInfo.isReading) {
-    //   readerInfo.closeAfterReadAndSendStats = stats;
-    // } else {
-    //   await this.closeReader(stats.jslid);
-    //   socket.emit(`jsldata-stats-${stats.jslid}`, stats);
-    // }
   },
+
+  // Writing an archive file (archive://...) needs archive/write, as the archive routes do; a
+  // file://... id can point into the archive too. Plain ids are the caller's own result sets.
+  async testJslWritePermission(jslid, req) {
+    if (!req) return;
+    if (typeof jslid == 'string' && (jslid.startsWith('archive://') || jslid.startsWith('file://'))) {
+      await testStandardPermission('archive/write', req);
+    }
+  },
+
+  saveText_access: 'self',
 
   saveText_meta: true,
-  async saveText({ jslid, text }) {
-    await fs.promises.writeFile(getJslFileName(jslid), text);
+  async saveText({ jslid, text }, req) {
+    await this.testJslWritePermission(jslid, req);
+    // openJslFileForWrite rather than a plain writeFile: getJslFileName settles where the jslid
+    // points, the no-follow open settles what is actually written to
+    const handle = await openJslFileForWrite(jslid);
+    try {
+      await handle.writeFile(text);
+    } finally {
+      await handle.close();
+    }
     return true;
   },
 
+  saveRows_access: 'self',
+
   saveRows_meta: true,
-  async saveRows({ jslid, rows }) {
-    const fileStream = fs.createWriteStream(getJslFileName(jslid));
-    for (const row of rows) {
-      await fileStream.write(JSON.stringify(row) + '\n');
+  async saveRows({ jslid, rows }, req) {
+    await this.testJslWritePermission(jslid, req);
+    const handle = await openJslFileForWrite(jslid);
+    try {
+      for (const row of rows) {
+        await handle.write(JSON.stringify(row) + '\n');
+      }
+    } finally {
+      await handle.close();
     }
-    await fileStream.close();
     return true;
   },
+
+  extractTimelineChart_access: 'user',
 
   extractTimelineChart_meta: true,
   async extractTimelineChart({ jslid, timestampFunction, aggregateFunction, measures }) {
     const timestamp = requirePluginFunction(timestampFunction);
     const aggregate = requirePluginFunction(aggregateFunction);
     const datastore = new JsonLinesDatastore(getJslFileName(jslid));
-    let mints = null;
-    let maxts = null;
-    // pass 1 - counts stats, time range
-    await datastore.enumRows(row => {
-      const ts = timestamp(row);
-      if (!mints || ts < mints) mints = ts;
-      if (!maxts || ts > maxts) maxts = ts;
-      return true;
-    });
-    const minTime = new Date(mints).getTime();
-    const maxTime = new Date(maxts).getTime();
-    const duration = maxTime - minTime;
-    const STEPS = 100;
-    let stepCount = duration > 100 * 1000 ? STEPS : Math.round((maxTime - minTime) / 1000);
-    if (stepCount < 2) {
-      stepCount = 2;
-    }
-    const stepDuration = duration / stepCount;
-    const labels = _.range(stepCount).map(i => new Date(minTime + stepDuration / 2 + stepDuration * i));
-
-    // const datasets = measures.map(m => ({
-    //   label: m.label,
-    //   data: Array(stepCount).fill(0),
-    // }));
-
-    const mproc = measures.map(m => ({
-      ...m,
-    }));
-
-    const data = Array(stepCount)
-      .fill(0)
-      .map(() => ({}));
-
-    // pass 2 - count measures
-    await datastore.enumRows(row => {
-      const ts = timestamp(row);
-      let part = Math.round((new Date(ts).getTime() - minTime) / stepDuration);
-      if (part < 0) part = 0;
-      if (part >= stepCount) part - stepCount - 1;
-      if (data[part]) {
-        data[part] = aggregate(data[part], row, stepDuration);
+    try {
+      let mints = null;
+      let maxts = null;
+      // pass 1 - counts stats, time range
+      await datastore.enumRows(row => {
+        const ts = timestamp(row);
+        if (!mints || ts < mints) mints = ts;
+        if (!maxts || ts > maxts) maxts = ts;
+        return true;
+      });
+      const minTime = new Date(mints).getTime();
+      const maxTime = new Date(maxts).getTime();
+      const duration = maxTime - minTime;
+      const STEPS = 100;
+      let stepCount = duration > 100 * 1000 ? STEPS : Math.round((maxTime - minTime) / 1000);
+      if (stepCount < 2) {
+        stepCount = 2;
       }
-      return true;
-    });
+      const stepDuration = duration / stepCount;
+      const labels = _.range(stepCount).map(i => new Date(minTime + stepDuration / 2 + stepDuration * i));
 
-    datastore._closeReader();
+      // const datasets = measures.map(m => ({
+      //   label: m.label,
+      //   data: Array(stepCount).fill(0),
+      // }));
 
-    // const measureByField = _.fromPairs(measures.map((m, i) => [m.field, i]));
+      const mproc = measures.map(m => ({
+        ...m,
+      }));
 
-    // for (let mindex = 0; mindex < measures.length; mindex++) {
-    //   for (let stepIndex = 0; stepIndex < stepCount; stepIndex++) {
-    //     const measure = measures[mindex];
-    //     if (measure.perSecond) {
-    //       datasets[mindex].data[stepIndex] /= stepDuration / 1000;
-    //     }
-    //     if (measure.perField) {
-    //       datasets[mindex].data[stepIndex] /= datasets[measureByField[measure.perField]].data[stepIndex];
-    //     }
-    //   }
-    // }
+      const data = Array(stepCount)
+        .fill(0)
+        .map(() => ({}));
 
-    // for (let i = 0; i < measures.length; i++) {
-    //   if (measures[i].hidden) {
-    //     datasets[i] = null;
-    //   }
-    // }
+      // pass 2 - count measures
+      await datastore.enumRows(row => {
+        const ts = timestamp(row);
+        let part = Math.round((new Date(ts).getTime() - minTime) / stepDuration);
+        if (part < 0) part = 0;
+        if (part >= stepCount) part - stepCount - 1;
+        if (data[part]) {
+          data[part] = aggregate(data[part], row, stepDuration);
+        }
+        return true;
+      });
 
-    return {
-      labels,
-      datasets: mproc.map(m => ({
-        label: m.label,
-        data: data.map(d => d[m.field] || 0),
-      })),
-    };
+      // const measureByField = _.fromPairs(measures.map((m, i) => [m.field, i]));
+
+      // for (let mindex = 0; mindex < measures.length; mindex++) {
+      //   for (let stepIndex = 0; stepIndex < stepCount; stepIndex++) {
+      //     const measure = measures[mindex];
+      //     if (measure.perSecond) {
+      //       datasets[mindex].data[stepIndex] /= stepDuration / 1000;
+      //     }
+      //     if (measure.perField) {
+      //       datasets[mindex].data[stepIndex] /= datasets[measureByField[measure.perField]].data[stepIndex];
+      //     }
+      //   }
+      // }
+
+      // for (let i = 0; i < measures.length; i++) {
+      //   if (measures[i].hidden) {
+      //     datasets[i] = null;
+      //   }
+      // }
+
+      return {
+        labels,
+        datasets: mproc.map(m => ({
+          label: m.label,
+          data: data.map(d => d[m.field] || 0),
+        })),
+      };
+    } finally {
+      await datastore.dispose();
+    }
   },
+
+  downloadJslData_access: 'user',
 
   downloadJslData_meta: true,
   async downloadJslData({ uri }) {
     const jslid = crypto.randomUUID();
-    await dbgateApi.download(uri, { targetFile: getJslFileName(jslid) });
+    await dbgateApi.download(uri, { targetFile: getJslFileName(jslid), safeRemoteFetch: true });
     return { jslid };
   },
+
+  buildChart_access: 'user',
 
   buildChart_meta: true,
   async buildChart({ jslid, definition }) {
     const datastore = new JsonLinesDatastore(getJslFileName(jslid));
     const processor = new ChartProcessor(definition ? [definition] : undefined);
-    await datastore.enumRows(row => {
-      processor.addRow(row);
-      return true;
-    });
+    try {
+      await datastore.enumRows(row => {
+        processor.addRow(row);
+        return true;
+      });
+    } finally {
+      await datastore.dispose();
+    }
     processor.finalize();
     return {
       charts: processor.charts,
