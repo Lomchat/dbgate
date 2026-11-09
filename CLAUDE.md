@@ -37,8 +37,8 @@ sleep 10 && systemctl is-active dbgate.service   # doit afficher 'active'
 Le service pointe directement dans ce dépôt :
 ```ini
 WorkingDirectory=/srv/dbgate/runtime
-EnvironmentFile=/srv/dbgate/runtime/.env     # PORT=9999, LOGIN_PASSWORD_admin
-ExecStart=<node20> /srv/dbgate/runtime/node_modules/dbgate-serve/bin/dbgate-serve.js
+EnvironmentFile=/srv/dbgate/runtime/.env     # PORT=9999, LISTEN_HOST, USAGE_ANALYTICS=false, LOGIN_PASSWORD_admin (fichier en 0600)
+ExecStart=/opt/node22/bin/node /srv/dbgate/runtime/node_modules/dbgate-serve/bin/dbgate-serve.js
 ```
 
 > Pourquoi un runtime npm plutôt qu'un lancement direct depuis les sources ? Parce que l'API résout le
@@ -47,7 +47,8 @@ ExecStart=<node20> /srv/dbgate/runtime/node_modules/dbgate-serve/bin/dbgate-serv
 > reproduire à coups de liens symboliques marcherait, mais casserait de façon obscure à la première
 > mise à jour. Le runtime npm reste la voie testée par l'amont.
 
-Accès public : `https://<DOMAINE>` → Apache (`/etc/httpd/conf.d/<DOMAINE>.conf`) → `localhost:9999`.
+Accès public : `https://<DOMAINE>` → Caddy (`/etc/caddy/Caddyfile`, bloc `<DOMAINE>`) → `127.0.0.1:9999`.
+(Apache a été remplacé par Caddy ; les mentions d'Apache plus bas sont historiques.)
 
 > Les valeurs réelles (domaine, IP, accès) sont dans `CLAUDE.local.md`, non versionné.
 
@@ -90,7 +91,7 @@ Trois pièges dans cette boucle, tous rencontrés en vrai :
 que la modification n'est pas passée. C'est de loin la fausse alerte la plus fréquente.
 
 **Le 503 juste après le déploiement.** DbGate met ~2 secondes à écouter après un `systemctl restart`.
-Pendant ce laps de temps Apache répond `503`. Ce n'est pas une panne : il faut simplement attendre.
+Pendant ce laps de temps le proxy répond `502`/`503`. Ce n'est pas une panne : il faut simplement attendre.
 
 **`deploy.sh` ne construit que le front** (`yarn build:web`). Une modification dans `packages/api/`
 n'est pas prise en compte : le back exécuté est celui de `runtime/node_modules/dbgate-api/`, un paquet
@@ -439,6 +440,36 @@ pour des défauts de la 7.3.4 d'origine :
 Nouveautés à connaître : `USAGE_ANALYTICS=false` dans `runtime/.env` (statistiques d'usage de la 7.3,
 case grisée « Managed by the USAGE_ANALYTICS environment variable ») ; le cloud passe de `*.dbgate.io` à
 `*.dbgate.cloud` — la ligne `/etc/hosts` `api.dbgate.io` ne sert plus à rien en 7.3.4 (laissée, inoffensive).
+
+#### Procédure de montée de version (appliquée le 09/11/2026, coupure ~1 s)
+
+Ne **jamais** lancer `npm install` dans `runtime/` pendant que le service tourne : les processus de
+connexion lancés entre-temps chargeraient le nouveau code sous l'ancien processus principal, et le
+premier redémarrage partirait sur le `main.js` d'origine (sans `LISTEN_HOST`). On prépare donc un
+runtime neuf à côté, puis on l'échange :
+
+```sh
+# 0. sources : fusionner le tag vX.Y.Z dans une branche, yarn install --frozen-lockfile (Node 24)
+# 1. sauvegardes
+tar czf /root/dbgate-backup-$(date +%F-%H%M)-avant-X.Y.Z.tar.gz /root/.dbgate /srv/dbgate/runtime/.env
+cp -a /srv/dbgate/runtime /srv/dbgate-runtime-<ancienne-version>
+# 2. runtime neuf, avec le Node 22 du service (modules natifs)
+mkdir /srv/dbgate-runtime-new && cd /srv/dbgate-runtime-new   # package.json : "dbgate-serve": "X.Y.Z" (exact)
+PATH=/opt/node22/bin:$PATH npm install
+# 3. personnalisations du fork sur ce runtime, sans redémarrer la prod
+DBGATE_RUNTIME=/srv/dbgate-runtime-new DBGATE_SERVICE=none /srv/dbgate/restore-all.sh
+command cp /srv/dbgate/runtime/.env /srv/dbgate-runtime-new/.env && chmod 600 /srv/dbgate-runtime-new/.env
+# 4. échange
+systemctl stop dbgate.service
+mv /srv/dbgate/runtime /srv/dbgate-runtime-old-swap && mv /srv/dbgate-runtime-new /srv/dbgate/runtime
+systemctl start dbgate.service
+```
+
+Retour arrière : `systemctl stop dbgate.service`, remettre `/srv/dbgate-runtime-<ancienne-version>` à la place
+de `runtime/`, `systemctl start dbgate.service`, puis `git checkout` de l'ancien commit du fork (sans
+force-push : ne pousser `custom-ui` qu'une fois la nouvelle version validée). Le format de
+`connections.jsonl` et `settings.json` n'a pas changé entre 7.1.6 et 7.3.4 ; la 7.3 ajoute seulement
+`archive/` et `uploads/` dans `/root/.dbgate`.
 
 ### Erreurs console de l'éditeur Ace (corrigées)
 
