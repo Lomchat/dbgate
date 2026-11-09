@@ -12,6 +12,7 @@ import { derived, writable } from 'svelte/store';
 import { extendDatabaseInfo } from 'dbgate-tools';
 import { setLocalStorage } from '../utility/storageCache';
 import { apiCall, apiOff, apiOn } from './api';
+import { getCurrentConfig } from '../stores';
 
 const databaseInfoLoader = ({ conid, database, modelTransFile }) => ({
   url: 'database-connections/structure',
@@ -219,6 +220,11 @@ const cloudContentListLoader = () => ({
   reloadTrigger: { key: `cloud-content-changed` },
   errorValue: [],
   onError: err => cloudContentErrorStore.set(!!err),
+  // Ce fork : depuis 7.3.4 l'API refuse cette route sans ALLOW_DBGATE_PRIVATE_CLOUD, mais le front
+  // l'appelait quand meme (DatabaseWidget, couleurs des connexions) : toast « API error: Private
+  // cloud is not enabled on this server » a chaque chargement. On ne la demande plus quand la
+  // config dit que le cloud prive est desactive.
+  skip: getCurrentConfig()?.allowPrivateCloud === false,
 });
 const teamFilesLoader = () => ({
   url: 'team-files/list',
@@ -244,8 +250,12 @@ const fileThemesLoader = () => ({
 });
 
 async function getCore(loader, args) {
-  const { url, params, reloadTrigger, transform, onLoaded, onError, errorValue } = loader(args);
+  const { url, params, reloadTrigger, transform, onLoaded, onError, errorValue, skip } = loader(args);
   const key = stableStringify({ url, ...params });
+  if (skip) {
+    if (onLoaded) onLoaded(errorValue);
+    return errorValue;
+  }
 
   async function doLoad() {
     const resp = await apiCall(url, params);

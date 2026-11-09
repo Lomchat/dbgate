@@ -37,7 +37,10 @@
 
   async function loadAvailableServers(amoid) {
     if (amoid) {
-      availableConnections = await apiCall('storage/get-connections-for-login-page', { amoid });
+      // Ce fork : en edition communautaire l'API refuse cette route (403, objet d'erreur au lieu
+      // d'un tableau) et `.find` plantait la page de login (« g?.find is not a function »).
+      const loaded = await apiCall('storage/get-connections-for-login-page', { amoid });
+      availableConnections = Array.isArray(loaded) ? loaded : null;
       if (availableConnections?.length > 0) {
         values.update(x => ({ ...x, databaseServer: availableConnections[0].conid }));
       }

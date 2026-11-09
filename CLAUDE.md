@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # ⚠️ Fork local — à lire en premier
 
-Ce dépôt est un **fork de DbGate figé sur le tag `v7.1.6`**, utilisé pour personnaliser l'interface
+Ce dépôt est un **fork de DbGate figé sur le tag `v7.3.4`** (montée depuis `v7.1.6` le 09/11/2026, voir plus bas), utilisé pour personnaliser l'interface
 d'une instance DbGate qui tourne sur ce serveur. Tout ce qui suit est spécifique à cette installation
 et ne vient pas du projet amont.
 
@@ -17,7 +17,7 @@ Il n'existe que **deux** emplacements DbGate sur ce serveur : ce dépôt, et les
 | Chemin | Rôle | Versionné ? |
 |---|---|---|
 | `/srv/dbgate` | **Ce dépôt.** Les sources modifiables, c'est ici qu'on code. | oui |
-| `/srv/dbgate/runtime/` | **L'instance qui tourne** : paquet npm `dbgate-serve@7.1.6`. Lancée par le service systemd `dbgate.service` sur le port 9999. | non (gitignore) |
+| `/srv/dbgate/runtime/` | **L'instance qui tourne** : paquet npm `dbgate-serve` (version exacte = celle des sources, `package.json` racine). Lancée par le service systemd `dbgate.service` sur le port 9999. | non (gitignore) |
 | `/srv/dbgate/backup/` | Sauvegardes horodatées du front, déposées par `deploy.sh` | non (gitignore) |
 | `/root/.dbgate` | **Les données** : connexions, mots de passe, historique, thèmes. Jamais dans le dépôt. | non |
 
@@ -50,6 +50,27 @@ ExecStart=<node20> /srv/dbgate/runtime/node_modules/dbgate-serve/bin/dbgate-serv
 Accès public : `https://<DOMAINE>` → Apache (`/etc/httpd/conf.d/<DOMAINE>.conf`) → `localhost:9999`.
 
 > Les valeurs réelles (domaine, IP, accès) sont dans `CLAUDE.local.md`, non versionné.
+
+## Scripts paramétrables (prod par défaut, instance de test possible)
+
+`deploy.sh`, `deploy-api.sh`, `deploy-plugin.sh` et `restore-all.sh` lisent `deploy-env.sh`. Sans variable,
+ils visent la prod exactement comme avant. Pour une autre instance :
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `DBGATE_RUNTIME` | `/srv/dbgate/runtime` | runtime npm à modifier |
+| `DBGATE_SERVICE` | `dbgate.service` | unité à redémarrer ; `none` = ne rien redémarrer |
+| `DBGATE_BACKUP` | `/srv/dbgate/backup` | sauvegardes (originaux api/plugins rangés **par version**) |
+| `DBGATE_PORT` | `9999` | port vérifié par `restore-all.sh` |
+| `DBGATE_RESTART_CMD` | — | commande de relance quand `DBGATE_SERVICE=none` |
+| `DBGATE_REPO` | dossier du script | sources à construire (un worktree, par ex.) |
+
+Exemple (instance de test de la montée 7.3.4, port 9998, données copiées dans `/srv/dbgate-test/data`) :
+```sh
+DBGATE_RUNTIME=/srv/dbgate-test/runtime DBGATE_SERVICE=none DBGATE_BACKUP=/srv/dbgate-test/backup \
+DBGATE_PORT=9998 DBGATE_RESTART_CMD=/srv/dbgate-test/start.sh /srv/dbgate/restore-all.sh
+```
+Le dossier de données se choisit par `WORKSPACE_DIR` dans le `.env` du runtime (sinon `~/.dbgate`).
 
 ## La boucle de travail
 
@@ -160,7 +181,7 @@ Le modèle de branches est le suivant :
 | Branche | Rôle |
 |---|---|
 | `master` | Miroir intact de l'amont. On n'y travaille jamais. |
-| `custom-ui` | **Tout le travail local**, basé sur le commit du tag `v7.1.6`. |
+| `custom-ui` | **Tout le travail local**, basé sur le tag amont de la version installée (`v7.3.4`). |
 
 Le bouton « Sync fork » de GitHub, appliqué à `custom-ui`, y **fusionne le master amont** : la branche
 saute alors de `7.1.6` à la dernière version de développement (une beta), et ne correspond plus au
@@ -170,14 +191,19 @@ conservée sous l'étiquette `backup/sync-merge-20260728`.
 Pour regarder ce qui a changé en amont sans rien casser :
 ```sh
 git fetch upstream
-git log --oneline v7.1.6..upstream/master
+git log --oneline v7.3.4..upstream/master
 ```
 
 ## Contraintes à respecter
 
-- **Rester sur `v7.1.6`.** Le front déployé doit correspondre à la version de `dbgate-serve` installée.
+- **Rester sur le tag installé (`v7.3.4`).** Le front déployé doit correspondre à la version de `dbgate-serve` installée.
+  `deploy.sh` et `deploy-api.sh` refusent désormais de déployer si les deux versions diffèrent.
   Une montée de version du fork sans montée équivalente de l'instance casse le contrat d'API.
-- **Node 20 obligatoire** (`nvm use 20`). Le shell par défaut est en Node 16, qui ne sait pas builder ce projet.
+- **Build : Node 24** (`/opt/node-v24.22.1-linux-x64/bin`, exigé par l'amont depuis 7.2 : `engines.node >= 24`), yarn 1
+  pris dans nvm (Node 20). `deploy-env.sh` règle ça tout seul. **Exécution : Node 22** (`/opt/node22/bin/node`,
+  celui de `dbgate.service`) — le `npm install` du runtime doit donc se faire avec ce Node-là, sinon les modules
+  natifs (better-sqlite3) ne se chargent pas : en 7.1.6 les connexions SQLite (hub, heimdall) étaient cassées
+  pour cette raison (module compilé pour Node 20).
 - **`packages/api/.env` contient `WORKSPACE_DIR=/srv/dbgate-data`.** Ce garde-fou empêche le serveur de dev
   (`yarn start`) d'écrire dans les vraies données. Le dossier est recréé vide au besoin. Ne jamais le
   faire pointer vers `/root/.dbgate`.
@@ -397,6 +423,22 @@ Conflits laissés à DbGate par défaut, car ce sont des actions applicatives l�
 ⚠️ Pour diagnostiquer un raccourci, chercher `keyText` dans **tout** `packages/web/src`, pas
 seulement dans `commands/stdCommands.ts` : les onglets et la grille de données en enregistrent aussi
 (`tabs/`, `datagrid/`).
+
+### Montée 7.1.6 → 7.3.4 (09/11/2026)
+
+Fusion du tag `v7.3.4` sans conflit ; les 16 modifications du fork sont intactes (le refresh de thèmes
+7.3.3 n'a renommé aucune variable utilisée par le fork ni par les 4 thèmes perso). Deux correctifs ajoutés,
+pour des défauts de la 7.3.4 d'origine :
+
+- `utility/metadataLoaders.ts` — le front appelait `cloud/content-list` à chaque chargement alors que l'API
+  la refuse sans `ALLOW_DBGATE_PRIVATE_CLOUD` : toast « API error: Private cloud is not enabled on this
+  server ». Le loader porte maintenant `skip` quand `config.allowPrivateCloud === false`.
+- `LoginPage.svelte` — `storage/get-connections-for-login-page` répond 403 en édition communautaire ; le
+  `.find` sur l'objet d'erreur levait « g?.find is not a function ». Garde `Array.isArray`.
+
+Nouveautés à connaître : `USAGE_ANALYTICS=false` dans `runtime/.env` (statistiques d'usage de la 7.3,
+case grisée « Managed by the USAGE_ANALYTICS environment variable ») ; le cloud passe de `*.dbgate.io` à
+`*.dbgate.cloud` — la ligne `/etc/hosts` `api.dbgate.io` ne sert plus à rien en 7.3.4 (laissée, inoffensive).
 
 ### Erreurs console de l'éditeur Ace (corrigées)
 

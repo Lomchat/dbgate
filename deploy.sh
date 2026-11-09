@@ -1,19 +1,18 @@
 #!/bin/bash
-# Deploie le front DbGate modifie vers le runtime npm embarque dans ce depot.
+# Deploie le front DbGate modifie vers le runtime npm (prod par defaut).
 # Usage : /srv/dbgate/deploy.sh
+# Cible et service reglables par variables, voir deploy-env.sh (ex. instance de test).
 set -e
+. "$(dirname "$0")/deploy-env.sh"
+use_build_node
 
-export NVM_DIR="/root/.nvm"
-. "$NVM_DIR/nvm.sh" >/dev/null 2>&1
-nvm use 20 >/dev/null 2>&1
-unset PORT API_URL
-
-REPO=/srv/dbgate
 SRC=$REPO/packages/web/public/
-DST=$REPO/runtime/node_modules/dbgate-web/public/
-BAK=$REPO/backup/public.$(date +%Y%m%d-%H%M%S)
+DST=$RUNTIME/node_modules/dbgate-web/public/
+BAK=$BACKUP_DIR/public.$(date +%Y%m%d-%H%M%S)
 
-echo "==> Build de production du front..."
+[ -d "$DST" ] || { echo "ERREUR : $DST introuvable" >&2; exit 1; }
+
+echo "==> Build de production du front ($REPO, node $(node -v))..."
 cd "$REPO"
 yarn build:web 2>&1 | grep -vE "A11y:|Unused CSS|svelte plugin" | tail -5
 
@@ -23,16 +22,22 @@ if grep -q "localhost:3000" "${SRC}build/bundle.js"; then
   exit 1
 fi
 
+echo "==> Garde-fou : version du front = version du runtime"
+WANT=$(node -p "require('$RUNTIME/node_modules/dbgate-web/package.json').version")
+HAVE_ROOT=$(node -p "require('$REPO/package.json').version")
+if [ "$WANT" != "$HAVE_ROOT" ]; then
+  echo "ERREUR : sources en $HAVE_ROOT, runtime en $WANT. Abandon (voir CLAUDE.md, contrainte de version)." >&2
+  exit 1
+fi
+
 echo "==> Sauvegarde de l'existant dans $BAK"
-mkdir -p "$REPO/backup"
+mkdir -p "$BACKUP_DIR"
 cp -a "$DST" "$BAK"
 
-echo "==> Bascule"
+echo "==> Bascule vers $DST"
 rsync -a --delete "$SRC" "$DST"
 
-echo "==> Redemarrage"
-systemctl restart dbgate.service
-systemctl is-active dbgate.service
+restart_service
 
 echo "==> OK. Pense au rafraichissement force du navigateur (Ctrl+Shift+R)"
-echo "    Rollback : rsync -a --delete $BAK/ $DST && systemctl restart dbgate.service"
+echo "    Rollback : rsync -a --delete $BAK/ $DST puis redemarrer ($SERVICE)"
