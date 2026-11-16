@@ -251,7 +251,8 @@ problème. Vérifier le rendu, pas seulement le DOM.
 ### Vérifier le rendu sans passer par son navigateur
 
 ```sh
-nvm use 20 && node tools/check-ui.js [data-testid]     # defaut : WidgetIconPanel_database
+(cd tools && npm install)                                     # une fois : Playwright, propre à tools/
+navig timeout 120 node tools/check-ui.js [data-testid]       # defaut : WidgetIconPanel_database
 ```
 
 Charge l'instance locale, se connecte, survole le bouton et rapporte si l'infobulle est réellement
