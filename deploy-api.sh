@@ -20,6 +20,8 @@ FILES=(
   main.js   # LISTEN_HOST : n'ecouter que sur 127.0.0.1 (Caddy relaie db.chalco.website)
   proc/databaseConnectionProcess.js
   proc/serverConnectionProcess.js
+  controllers/auth.js        # anti brute force de auth/login (10 echecs / 15 min / IP, 429)
+  auth/authProvider.js       # comparaison des mots de passe en temps constant
 )
 
 # Les sources doivent etre celles de la version installee, sinon on melange deux versions.

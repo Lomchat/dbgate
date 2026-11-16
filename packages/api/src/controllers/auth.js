@@ -38,6 +38,112 @@ const {
 
 const logger = getLogger('auth');
 
+// Brute force protection of auth/login: per client IP, in memory, no global lock
+// (an attacker must not be able to lock the owner out).
+const LOGIN_MAX_FAILURES = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_FAIL_DELAY_MS = 400;
+const LOGIN_MAX_TRACKED_IPS = 10000;
+const loginFailures = new Map(); // ip => { count, resetAt }
+
+function getLoginClientIp(req) {
+  // The reverse proxy (Caddy) sets X-Forwarded-For to the real client IP only
+  const forwarded = String(req.headers?.['x-forwarded-for'] ?? '')
+    .split(',')
+    .pop()
+    .trim();
+  return forwarded || req.socket?.remoteAddress || 'unknown';
+}
+
+function getLoginBlockedSeconds(ip) {
+  const rec = loginFailures.get(ip);
+  if (!rec || rec.resetAt <= Date.now()) return 0;
+  return rec.count >= LOGIN_MAX_FAILURES ? Math.ceil((rec.resetAt - Date.now()) / 1000) : 0;
+}
+
+function registerLoginFailure(ip) {
+  const now = Date.now();
+  const rec = loginFailures.get(ip);
+  if (rec && rec.resetAt > now) {
+    rec.count += 1;
+  } else {
+    if (loginFailures.size >= LOGIN_MAX_TRACKED_IPS) {
+      // bounded size: drop the oldest entry
+      loginFailures.delete(loginFailures.keys().next().value);
+    }
+    loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of loginFailures) {
+    if (rec.resetAt <= now) loginFailures.delete(ip);
+  }
+}, 60 * 1000).unref();
+
+async function processLogin(params, req) {
+  const { amoid, login, password, isAdminPage } = params;
+
+  if (isAdminPage) {
+    let adminPassword = process.env.ADMIN_PASSWORD;
+    if (!adminPassword) {
+      const adminConfig = await storage.readConfig({ group: 'admin' });
+      adminPassword = decryptPasswordString(adminConfig?.adminPassword);
+    }
+    if (adminPassword && adminPassword == password) {
+      if (!(await isLoginLicensed(req, `superadmin`))) {
+        return { error: LOGIN_LIMIT_ERROR };
+      }
+
+      sendToAuditLog(req, {
+        category: 'auth',
+        component: 'AuthController',
+        action: 'login',
+        event: 'login.admin',
+        severity: 'info',
+        message: 'Administration login successful',
+      });
+
+      const licenseUid = `superadmin`;
+      const accessToken = jwt.sign(
+        {
+          login: 'superadmin',
+          roleId: -3,
+          licenseUid,
+          amoid: 'superadmin',
+        },
+        getTokenSecret(),
+        {
+          expiresIn: getTokenLifetime(),
+        }
+      );
+      markTokenAsLoggedIn(licenseUid, accessToken);
+
+      return {
+        accessToken,
+      };
+    }
+
+    sendToAuditLog(req, {
+      category: 'auth',
+      component: 'AuthController',
+      action: 'loginFail',
+      event: 'login.adminFailed',
+      severity: 'warn',
+      message: 'Administraton login failed',
+    });
+
+    return { error: 'Login failed' };
+  }
+
+  const authProvider = getAuthProviderById(amoid);
+  if (!authProvider) {
+    return { error: 'Login failed' };
+  }
+  return authProvider.login(login, password, undefined, req);
+}
+
 function unauthorizedResponse(req, res, text, mcpAuthMode = null) {
   // if (req.path == getExpressPath('/config/get-settings')) {
   //   return res.json({});
@@ -197,65 +303,21 @@ module.exports = {
   login_access: 'public',
   login_meta: true,
   async login(params, req) {
-    const { amoid, login, password, isAdminPage } = params;
-
-    if (isAdminPage) {
-      let adminPassword = process.env.ADMIN_PASSWORD;
-      if (!adminPassword) {
-        const adminConfig = await storage.readConfig({ group: 'admin' });
-        adminPassword = decryptPasswordString(adminConfig?.adminPassword);
-      }
-      if (adminPassword && adminPassword == password) {
-        if (!(await isLoginLicensed(req, `superadmin`))) {
-          return { error: LOGIN_LIMIT_ERROR };
-        }
-
-        sendToAuditLog(req, {
-          category: 'auth',
-          component: 'AuthController',
-          action: 'login',
-          event: 'login.admin',
-          severity: 'info',
-          message: 'Administration login successful',
-        });
-
-        const licenseUid = `superadmin`;
-        const accessToken = jwt.sign(
-          {
-            login: 'superadmin',
-            roleId: -3,
-            licenseUid,
-            amoid: 'superadmin',
-          },
-          getTokenSecret(),
-          {
-            expiresIn: getTokenLifetime(),
-          }
-        );
-        markTokenAsLoggedIn(licenseUid, accessToken);
-
-        return {
-          accessToken,
-        };
-      }
-
-      sendToAuditLog(req, {
-        category: 'auth',
-        component: 'AuthController',
-        action: 'loginFail',
-        event: 'login.adminFailed',
-        severity: 'warn',
-        message: 'Administraton login failed',
-      });
-
-      return { error: 'Login failed' };
+    const ip = getLoginClientIp(req);
+    const blockedSec = getLoginBlockedSeconds(ip);
+    if (blockedSec > 0) {
+      req.res?.status(429);
+      return { error: `Trop de tentatives, réessayez dans ${Math.ceil(blockedSec / 60)} min` };
     }
 
-    const authProvider = getAuthProviderById(amoid);
-    if (!authProvider) {
-      return { error: 'Login failed' };
+    const resp = await processLogin(params, req);
+    if (resp?.accessToken) {
+      loginFailures.delete(ip);
+    } else {
+      registerLoginFailure(ip);
+      await new Promise(resolve => setTimeout(resolve, LOGIN_FAIL_DELAY_MS));
     }
-    return authProvider.login(login, password, undefined, req);
+    return resp;
   },
 
   getProviders_access: 'public',

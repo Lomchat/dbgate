@@ -5,8 +5,15 @@ const { getLogger, getPredefinedPermissions } = require('dbgate-tools');
 
 const AD = require('activedirectory2').promiseWrapper;
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const logger = getLogger('authProvider');
+
+// constant-time comparison (SHA-256 hashes have the same length whatever the inputs are)
+function safeEquals(a, b) {
+  const hash = x => crypto.createHash('sha256').update(String(x ?? '')).digest();
+  return crypto.timingSafeEqual(hash(a), hash(b));
+}
 
 class AuthProviderBase {
   amoid = 'none';
@@ -236,7 +243,7 @@ class LoginsProvider extends AuthProviderBase {
   amoid = 'logins';
 
   async login(login, password, options = undefined) {
-    if (login && password && process.env['LOGIN'] == login && process.env['PASSWORD'] == password) {
+    if (login && password && process.env['LOGIN'] == login && safeEquals(process.env['PASSWORD'], password)) {
       return {
         accessToken: jwt.sign(
           {
@@ -249,7 +256,8 @@ class LoginsProvider extends AuthProviderBase {
       };
     }
 
-    if (password && password == process.env[`LOGIN_PASSWORD_${login}`]) {
+    const expectedPassword = process.env[`LOGIN_PASSWORD_${login}`];
+    if (password && expectedPassword != null && safeEquals(expectedPassword, password)) {
       return {
         accessToken: jwt.sign(
           {
